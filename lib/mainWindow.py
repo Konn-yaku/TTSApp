@@ -97,5 +97,5 @@ class TTSApp:
         if user_input:
             # 在这里可以添加调用 TTS 引擎、处理文本等逻辑
             if func is not None:
-                func(*args)
+                func(user_input, *args)
             self.text_entry.delete(0, tk.END)  # 清空输入框
