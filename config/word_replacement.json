@@ -1,0 +1,67 @@
+[
+    {
+        "before": "真得",
+        "after": "真该",
+        "re": false
+    },
+    {
+        "before": "191",
+        "after": "幺九幺",
+        "re": false
+    },
+    {
+        "before": "cod",
+        "after": "C O D",
+        "re": false
+    },
+    {
+        "before": "ads",
+        "after": "A D S",
+        "re": false
+    },
+    {
+        "before": "弹鼓",
+        "after": "蛋鼓",
+        "re": false
+    },
+    {
+        "before": "[aA][iI]",
+        "after": "A I",
+        "re": true
+    },
+    {
+        "before": "了没",
+        "after": "了梅",
+        "re": true
+    },
+    {
+        "before": "1弹",
+        "after": "1蛋",
+        "re": false
+    },
+    {
+        "before": "2弹",
+        "after": "2蛋",
+        "re": false
+    },
+    {
+        "before": "3弹",
+        "after": "3蛋",
+        "re": false
+    },
+    {
+        "before": "4弹",
+        "after": "4蛋",
+        "re": false
+    },
+    {
+        "before": "5弹",
+        "after": "5蛋",
+        "re": false
+    },
+    {
+        "before": "6弹",
+        "after": "6蛋",
+        "re": false
+    }
+]

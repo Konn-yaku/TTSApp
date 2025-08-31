@@ -1,5 +1,7 @@
 import hashlib
 import json
+import re
+
 import requests
 import pygame
 import time
@@ -10,19 +12,47 @@ from pathlib import Path
 
 # --- 配置 ---
 class Config:
-    def __init__(self, config_path):
+    def __init__(self, *config_path):
+        self.WORD_REPLACEMENT = None
+        self.FIXED_COLLOCATION = None
         self.API_ENDPOINT = None
         self.BASE_URL = None
         self.FULL_API_URL = None
-        self.load(config_path)
+        self.load(*config_path)
 
-    def load(self, config_path):
-        with open(config_path, 'r', encoding='utf-8') as f:
+    def load(self, *config_path):
+        with open(config_path[0], 'r', encoding='utf-8') as f:
             data = json.load(f)
             # 直接将字典的键值对作为实例属性
             self.__dict__.update(data)
         # 计算派生属性
         self.FULL_API_URL = self.BASE_URL + self.API_ENDPOINT
+
+        with open(config_path[1], 'r', encoding='utf-8') as f:
+            self.FIXED_COLLOCATION = json.loads(f.read())
+
+        with open(config_path[2], 'r', encoding='utf-8') as f:
+            self.WORD_REPLACEMENT = json.loads(f.read())
+
+
+def search_fixed_collocation(text, config):
+    for collocation in config.FIXED_COLLOCATION:
+        if collocation["before"] == text:
+            return collocation["after"]
+    return text
+
+
+def re_search_word_replacement(text, replacement):
+    return re.sub(replacement["before"], replacement["after"], text)
+
+
+def search_word_replacement(text, config):
+    for replacement in config.WORD_REPLACEMENT:
+        if replacement["re"]:
+            text = re_search_word_replacement(text, replacement)
+        else:
+            text = text.replace(replacement["before"], replacement["after"])
+    return text
 
 
 # --- 配置结束 ---
@@ -248,6 +278,8 @@ def cleanup_pygame():
 
 def text_to_speech(text, config):
     def target(text, config):
+        text = search_fixed_collocation(text, config)
+        text = search_word_replacement(text, config)
         hashed_text = hashlib.md5(
             f'{config.VOICE}{config.VOICE_STYLE}{config.SPEED}{config.PITCH}{text}'.encode('utf-8')).hexdigest()
         cache_dir = Path(config.STORED_FILEPATH)
