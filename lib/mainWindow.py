@@ -2,8 +2,10 @@ import tkinter as tk
 import win32gui
 import win32con
 
+
 class DraggableWindow(tk.Tk):
     """使窗口可以通过鼠标拖拽标题栏以外的区域移动"""
+
     def __init__(self):
         super().__init__()
         self.old_x = None
@@ -25,6 +27,7 @@ class DraggableWindow(tk.Tk):
             x = self.winfo_x() + deltax
             y = self.winfo_y() + deltay
             self.geometry(f"+{x}+{y}")
+
 
 class TTSApp:
     def __init__(self, root, func, *args):
@@ -53,7 +56,7 @@ class TTSApp:
             main_frame,
             text="窗口置顶",
             variable=self.top_var,
-            onvalue=1,   # 勾选时值为1
+            onvalue=1,  # 勾选时值为1
             offvalue=0,  # 取消勾选时值为0
             command=self.toggle_topmost  # 当状态改变时调用此函数
         )
