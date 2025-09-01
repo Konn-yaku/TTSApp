@@ -1,6 +1,7 @@
 import tkinter as tk
 import win32gui
 import win32con
+from lib.globalHotkeyManager import GlobalHotkeyManager
 
 
 class DraggableWindow(tk.Tk):
@@ -30,11 +31,12 @@ class DraggableWindow(tk.Tk):
 
 
 class TTSApp:
-    def __init__(self, root, func, *args):
+    def __init__(self, root, hotkey_manager, func, *args):
         self.root = root
         self.root.title("tts")
         self.root.geometry("200x120")  # 与您代码中的尺寸一致
         self.root.resizable(False, False)  # 通常这类小工具窗口不可调整大小
+        self.hotkey_manager = hotkey_manager
 
         # --- 创建主框架并居中所有内容 ---
         # 使用 place 配合 relx/rely/anchor 是实现居中的常用方法
@@ -62,12 +64,34 @@ class TTSApp:
         )
         self.top_checkbox.pack(pady=(5, 0))
 
+        # --- 4. Checkbox: 启动全局快捷键 ---
+        self.shortcut_var = tk.IntVar(value=0)
+        self.shortcut_checkbox = tk.Checkbutton(
+            main_frame,
+            text="启用快捷键",
+            variable=self.shortcut_var,
+            onvalue=1,
+            offvalue=0,
+            command=self.update_shortcut_key
+        )
+        self.shortcut_checkbox.pack(pady=(5, 0))
+
         # --- 初始化窗口置顶状态 ---
         # 根据初始值 (0) 设置窗口不置顶
         self.update_window_topmost()
 
+        # --- 初始化快捷键状态 ---
+        # 根据初始值 (0) 设置快捷键不开启
+        self.update_shortcut_key()
+
         # --- 绑定回车键提交 ---
         self.text_entry.bind('<Return>', lambda event: self.submit_text(func, *args))
+
+    def update_shortcut_key(self):
+        if self.shortcut_var.get() == 1:
+            self.hotkey_manager.start()
+        else:
+            self.hotkey_manager.stop()
 
     def toggle_topmost(self):
         """复选框状态改变时调用，更新窗口置顶属性"""

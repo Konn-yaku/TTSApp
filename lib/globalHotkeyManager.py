@@ -1,5 +1,4 @@
 import json
-import threading
 from pynput import keyboard
 from pathlib import Path
 from lib.ttsEngine import text_to_speech
