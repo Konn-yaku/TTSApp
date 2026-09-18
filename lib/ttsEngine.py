@@ -344,12 +344,15 @@ def text_to_speech_web_api(text, config):
     # 3. 发送请求并读完整正文（复用 _http 的持久连接，省去 TCP/TLS 握手）
     #
     # 失败时最多重发一次，目的就是「不让用户再手动按一次回车」：
-    #   ReadTimeout     -> 重发。服务端偶发卡顿；代价是这次合成可能被重复消耗一次
-    #                      （请求可能已经送达服务端），并且总等待时间翻倍。
+    #   ReadTimeout     -> 重发。服务端偶发卡顿。
     #   ConnectionError -> 重发。多半是连接池里残留的、已被服务端关闭的连接，
     #                      请求根本没送达，重发几乎必然成功。
-    #   ConnectTimeout  -> 不重发。握手都完不成，说明对面就是慢，再等一次没意义。
+    #   ConnectTimeout  -> 重发。握手超时可能只是网络抖动。
     #   非 200          -> 不重发。请求本身有问题，重发结果一样。
+    #
+    # 选择「宁可多发一次」：多发一次几乎没有成本（免费额度，不额外计费），
+    # 而让用户手动再按一次回车的体验更差。代价是失败确认时间翻倍，
+    # 最坏 2s + 2s = 4s，仍在 5 秒以内。
     #
     # 重发不会造成「播放两遍」：只有完整拿到了音频字节才会把它交给播放队列，
     # 超时那次被放弃的响应对象直接丢弃，永远进不了队列。
@@ -386,10 +389,11 @@ def text_to_speech_web_api(text, config):
             return audio_data
 
         except requests.exceptions.ConnectTimeout as e:
-            # 握手都没完成，属于「慢」而不是「连接失效」，重发不划算
-            print(f"Connect timeout: {e}")
-            emit_log("[失败] 连接超时")
-            return None
+            print(f"Connect timeout (attempt {attempt}/2): {e}")
+            last_failure = '连接超时'
+            if attempt == 2:
+                break
+            emit_log("[重试] 连接超时，自动重发一次")
         except requests.exceptions.ReadTimeout as e:
             print(f"Read timeout (attempt {attempt}/2): {e}")
             last_failure = '请求超时'
