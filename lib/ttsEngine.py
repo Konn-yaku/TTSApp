@@ -1,3 +1,4 @@
+import collections
 import hashlib
 import itertools
 import json
@@ -38,9 +39,28 @@ def resolve_path(path):
 # 所以工作线程只往队列里放文本，由界面主线程定时取出写进文本框。
 _log_queue = queue.Queue()
 
+# 当前线程正在处理哪一条请求。
+# 合成线程与播放线程各自设置，设置后该线程发出的日志会自动带上 #N，
+# 这样即使两条请求的日志交错在一起，也能一眼看出哪行属于谁。
+_log_context = threading.local()
 
-def emit_log(message):
-    """推送一条日志给界面显示。任意线程都可以安全调用。"""
+
+def set_request_index(index):
+    """把本线程后续发出的日志标记为属于某一条请求。"""
+    _log_context.index = index
+
+
+def emit_log(message, with_index=True):
+    """推送一条日志给界面显示。任意线程都可以安全调用。
+
+    with_index=False 用于分隔标题本身，否则会变成「#1 ---- 第 1 条 ----」。
+    """
+    index = getattr(_log_context, 'index', None)
+    if with_index and index is not None:
+        # 编号插在最前面，但保留原有缩进，免得子项（延迟分解）失去对齐
+        content = message.lstrip(' ')
+        indent = message[:len(message) - len(content)]
+        message = f"#{index}{indent} {content}"
     _log_queue.put(message)
 
 
@@ -129,6 +149,12 @@ _http = requests.Session()
 # 创建一个全局的播放队列
 _playback_queue = queue.Queue()
 
+# 一条待播放任务。用命名元组而不是裸元组：字段已经有 6 个，位置很容易记错。
+_PlaybackTask = collections.namedtuple(
+    '_PlaybackTask',
+    ['path', 'queued_at', 'requested_at', 'ready_ms', 'ready_label', 'index'],
+)
+
 # 播放线程的控制事件
 _stop_playback = threading.Event()
 
@@ -146,11 +172,16 @@ def _playback_worker():
     """播放队列中的音频文件的工作线程。"""
     while not _stop_playback.is_set():
         try:
-            # 从队列中获取下一个任务：
-            # (文件路径, 入队时刻, 请求发出时刻, 音频就绪耗时, 该耗时的名称)
-            # block=True, timeout=1.0 避免无限阻塞，允许检查 _stop_playback
-            (mp3_file_path, queued_at, requested_at,
-             ready_ms, ready_label) = _playback_queue.get(timeout=1.0)
+            # 从队列中获取下一个任务。block=True, timeout=1.0 避免无限阻塞，
+            # 以便周期性检查 _stop_playback
+            task = _playback_queue.get(timeout=1.0)
+            mp3_file_path = task.path
+            queued_at = task.queued_at
+            requested_at = task.requested_at
+            ready_ms = task.ready_ms
+            ready_label = task.ready_label
+            # 之后本线程发出的日志（播放开始/结束、延迟）都会带上这条请求的编号
+            set_request_index(task.index)
 
             # 处理获取到的路径
             file_path = Path(mp3_file_path)
@@ -195,7 +226,7 @@ def _playback_worker():
 
                 emit_log("[播放] 结束")
 
-                # 三项耗时先各自取整再相加5作为总数，这样「总数 = 各项之和」
+                # 三项耗时先各自取整再相加作为总数，这样「总数 = 各项之和」
                 # 在界面上永远成立（与真实耗时的差在 1 ms 以内）
                 decode_ms = round((t_loaded - t_load) * 1000)
                 queue_ms = round((t_playing - queued_at) * 1000) - decode_ms
@@ -259,49 +290,6 @@ def _rewarm_in_background(config):
     threading.Thread(target=warm_up, args=(config, '重连'), daemon=True).start()
 
 
-def _post_ssml(config, headers, ssml):
-    """发送 SSML 请求，只在「连接类失败」时重试一次。
-
-    连接池里可能残留一条已被服务端关闭的连接，此时请求根本没送达，
-    换一条新连接重发是安全的，而且几乎必然成功。
-
-    读超时 / 连接超时都**不重试**：
-      - 它们说明服务端慢，重试只会让等待时间翻倍；
-      - 请求可能已经送达并被合成，重发等于重复消耗额度。
-    """
-    last_error = None
-    for attempt in (1, 2):
-        try:
-            response = _http.post(
-                url=config.FULL_API_URL,
-                headers=headers,
-                data=ssml.encode('utf-8'),  # 确保 SSML 字符串以 UTF-8 编码发送
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-                stream=True,
-            )
-            if attempt == 2:
-                print("Retried after a connection error and succeeded.")
-                emit_log("[重试] 连接失败，重发成功")
-            return response
-        except requests.exceptions.ConnectTimeout as e:
-            # 握手都没完成，属于「慢」而不是「连接失效」，重试不划算
-            print(f"Connect timeout: {e}")
-            emit_log("[失败] 连接超时")
-            return None
-        except requests.exceptions.ConnectionError as e:
-            last_error = e
-            print(f"Connection error (attempt {attempt}/2): {e}")
-            continue
-        except requests.exceptions.RequestException as e:
-            print(f"Request failed: {e}")
-            emit_log(f"[失败] 网络异常（{type(e).__name__}）")
-            return None
-
-    print(f"Connection failed twice, giving up: {last_error}")
-    emit_log("[失败] 无法连接服务器")
-    return None
-
-
 def text_to_speech_web_api(text, config):
     """
     模拟网页行为，通过POST请求调用TTS API生成语音。
@@ -353,36 +341,76 @@ def text_to_speech_web_api(text, config):
         'Voice-Variant': config.VOICE.lower(),  # 语音变体，小写
     }
 
-    # 3. 发送 POST 请求（复用 _http 的持久连接，省去 TCP/TLS 握手）
-    try:
-        # stream=True：先只拿到响应头，便于把「等待服务端」与「接收数据」分开计时
-        t_start = time.perf_counter()
-        response = _post_ssml(config, headers, ssml)
-        t_header = time.perf_counter()
-        if response is None:
+    # 3. 发送请求并读完整正文（复用 _http 的持久连接，省去 TCP/TLS 握手）
+    #
+    # 失败时最多重发一次，目的就是「不让用户再手动按一次回车」：
+    #   ReadTimeout     -> 重发。服务端偶发卡顿；代价是这次合成可能被重复消耗一次
+    #                      （请求可能已经送达服务端），并且总等待时间翻倍。
+    #   ConnectionError -> 重发。多半是连接池里残留的、已被服务端关闭的连接，
+    #                      请求根本没送达，重发几乎必然成功。
+    #   ConnectTimeout  -> 不重发。握手都完不成，说明对面就是慢，再等一次没意义。
+    #   非 200          -> 不重发。请求本身有问题，重发结果一样。
+    #
+    # 重发不会造成「播放两遍」：只有完整拿到了音频字节才会把它交给播放队列，
+    # 超时那次被放弃的响应对象直接丢弃，永远进不了队列。
+    last_failure = None
+    for attempt in (1, 2):
+        try:
+            # stream=True：先只拿到响应头，便于把「等待服务端」与「接收数据」分开计时
+            t_start = time.perf_counter()
+            response = _http.post(
+                url=config.FULL_API_URL,
+                headers=headers,
+                data=ssml.encode('utf-8'),  # 确保 SSML 字符串以 UTF-8 编码发送
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                stream=True,
+            )
+            t_header = time.perf_counter()
+
+            # 4. 检查响应状态
+            if response.status_code != 200:
+                print(f"TTS API Error: {response.status_code} - {response.text}")
+                emit_log(f"[失败] 服务端返回 {response.status_code}")
+                return None
+
+            # 5. 读取响应体
+            #    必须读完整，否则连接不会被归还到连接池，下一句又要重新握手
+            audio_data = response.content
+            t_body = time.perf_counter()
+
+            print(f"[TTS]   请求 → 响应头   {(t_header - t_start) * 1000:.0f} ms")
+            print(f"[TTS]   接收数据        {(t_body - t_header) * 1000:.0f} ms")
+            if attempt == 2:
+                print("Succeeded on the automatic retry.")
+                emit_log("[重试] 自动重发成功")
+            return audio_data
+
+        except requests.exceptions.ConnectTimeout as e:
+            # 握手都没完成，属于「慢」而不是「连接失效」，重发不划算
+            print(f"Connect timeout: {e}")
+            emit_log("[失败] 连接超时")
+            return None
+        except requests.exceptions.ReadTimeout as e:
+            print(f"Read timeout (attempt {attempt}/2): {e}")
+            last_failure = '请求超时'
+            if attempt == 2:
+                break
+            emit_log("[重试] 请求超时，自动重发一次")
+        except requests.exceptions.ConnectionError as e:
+            print(f"Connection error (attempt {attempt}/2): {e}")
+            last_failure = '无法连接服务器'
+            if attempt == 2:
+                break
+            emit_log("[重试] 连接失败，自动重发一次")
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+            # 界面只报异常类型名，完整信息留给控制台，避免把日志行撑爆
+            emit_log(f"[失败] 网络异常（{type(e).__name__}）")
             return None
 
-        # 4. 检查响应状态
-        if response.status_code != 200:
-            print(f"TTS API Error: {response.status_code} - {response.text}")
-            emit_log(f"[失败] 服务端返回 {response.status_code}")
-            return None
-
-        # 5. 读取响应体
-        #    必须读完整，否则连接不会被归还到连接池，下一句又要重新握手
-        audio_data = response.content
-        t_body = time.perf_counter()
-
-        print(f"[TTS]   请求 → 响应头   {(t_header - t_start) * 1000:.0f} ms")
-        print(f"[TTS]   接收数据        {(t_body - t_header) * 1000:.0f} ms")
-        return audio_data
-
-    except requests.exceptions.RequestException as e:
-        # 走到这里说明是「读取正文」阶段失败的（发送阶段的失败已在 _post_ssml 里处理）
-        print(f"Failed while reading response body: {e}")
-        # 界面只报异常类型名，完整信息留给控制台，避免把日志行撑爆
-        emit_log(f"[失败] 网络异常（{type(e).__name__}）")
-        return None
+    print(f"Gave up after two attempts ({last_failure}).")
+    emit_log(f"[失败] {last_failure}（已自动重发一次）")
+    return None
 
 
 def save_audio_to_file(audio_bytes, config, filename):
@@ -429,15 +457,18 @@ def save_audio_to_file(audio_bytes, config, filename):
                 pass
 
 
-def play_in_background_queued(mp3_path, requested_at=None, ready_ms=None, ready_label='合成'):
+def play_in_background_queued(mp3_path, requested_at=None, ready_ms=None,
+                              ready_label='合成', index=None):
     """将播放请求添加到队列中。
 
     requested_at: 用户触发本次请求（按回车 / 按热键）的时刻，
                   用于统计「按键 → 出声」的端到端延迟。
     ready_ms:     从 requested_at 到音频就绪（已落盘 / 已命中缓存）的耗时。
     ready_label:  上述耗时在界面上的名称：「合成」或「命中」。
+    index:        请求编号，让播放阶段的日志也能带上 #N。
     """
-    _playback_queue.put((mp3_path, time.perf_counter(), requested_at, ready_ms, ready_label))
+    _playback_queue.put(_PlaybackTask(mp3_path, time.perf_counter(), requested_at,
+                                      ready_ms, ready_label, index))
     print(f"Queued for playback: {mp3_path}")
 
 
@@ -459,15 +490,21 @@ def text_to_speech(text, config):
         cache_dir = Path(config.STORED_FILEPATH)
         cache_file_path = cache_dir / f"{hashed_text}.mp3"
 
-        # 分隔标题：一条请求的日志从这里开始，方便在界面上区分前后两条
-        emit_log(f"---- 第 {next(_request_seq)} 条：「{_brief(text)}」 ----")
+        # 分隔标题：一条请求的日志从这里开始，方便在界面上区分前后两条。
+        # 标题本身不带 #N，否则会变成「#1 ---- 第 1 条 ----」。
+        index = next(_request_seq)
+        emit_log(f"---- 第 {index} 条：「{_brief(text)}」 ----", with_index=False)
+        # 之后本线程发出的日志（含 text_to_speech_web_api、save_audio_to_file）
+        # 都会自动带上 #N
+        set_request_index(index)
 
         # 如果缓存文件存在，将其加入播放队列
         if cache_file_path.exists():
             print("[TTS] 缓存命中")
             emit_log("[缓存] 命中，跳过合成")
             play_in_background_queued(cache_file_path, requested_at,
-                                      (time.perf_counter() - requested_at) * 1000, '命中')
+                                      (time.perf_counter() - requested_at) * 1000,
+                                      '命中', index)
             return
 
         # 缓存不存在，生成音频
@@ -493,7 +530,7 @@ def text_to_speech(text, config):
         emit_log(f"[合成] 完成  {ready_ms:.0f} ms")
 
         # 只有确实拿到音频文件才加入播放队列
-        play_in_background_queued(cache_file_path, requested_at, ready_ms, '合成')
+        play_in_background_queued(cache_file_path, requested_at, ready_ms, '合成', index)
 
     thread = threading.Thread(target=target, args=(text, config), daemon=True)
     thread.start()
