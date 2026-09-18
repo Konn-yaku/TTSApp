@@ -158,9 +158,13 @@ ATTEMPT_LIMIT = 2       # 最多尝试几次
 DEFAULT_WARM_CONNECTIONS = 2
 
 # 空闲超过这么久，就认为池子里的连接可能已被服务端关掉，
-# 于是在「用户开始打字」时补一次预热。
+# 于是在「输入框里出现文字」时补一次预热。
 # 实测：空闲 100 秒仍能复用，空闲 300 秒已被关闭 ⇒ 超时在 100-300 秒之间。
+#
+# 实际取值优先读配置里的 IDLE_REWARM_SECONDS（方便调参），没有就用下面的默认值。
+# 下限 IDLE_REWARM_MIN：设成 0 或负数会让「每次内容变化都预热」，变成发请求的洪水。
 IDLE_REWARM_AFTER = 100.0
+IDLE_REWARM_MIN = 5.0
 
 # 全局复用的 HTTP 会话。
 # 复用 TCP/TLS 连接，避免每次请求都重新握手（实测每次新建连接需 2-4 秒）。
@@ -417,23 +421,33 @@ def warm_up(config, tag='启动', count=None):
 
 
 def ensure_warm(config):
-    """空闲太久时补一次预热 —— 供界面在「用户开始打字」时调用。
+    """空闲太久时补一次预热 —— 供界面在「输入框里出现文字」时调用。
 
-    内部自己节流：只有距上次网络活动超过 IDLE_REWARM_AFTER 秒才真正动手，
-    所以每次按键都调用它是安全的，不会变成发请求的洪水。
+    内部自己节流：只有距上次网络活动超过阈值才真正动手，
+    所以内容一变就调用它是安全的，不会变成发请求的洪水。
 
-    实测服务端会在 100-300 秒之间把空闲连接关掉。在你开始打字时补一条，
-    等你打完按回车，连接通常已经建好（握手约 0.7 秒），这一句就是热的。
-    空闲不输入时不会产生任何请求。
+    阈值优先读配置里的 IDLE_REWARM_SECONDS，没有则用 IDLE_REWARM_AFTER。
+
+    实测服务端会在 100-300 秒之间把空闲连接关掉。在输入框一出现文字时补一条，
+    等你按回车，连接通常已经建好（握手约 0.7 秒），这一句就是热的。
+    不打字时不会产生任何请求。
     """
     global _last_activity
+
+    threshold = getattr(config, 'IDLE_REWARM_SECONDS', IDLE_REWARM_AFTER)
+    try:
+        threshold = max(IDLE_REWARM_MIN, float(threshold))
+    except (TypeError, ValueError):
+        print(f"Invalid IDLE_REWARM_SECONDS={threshold!r}; using {IDLE_REWARM_AFTER}.")
+        threshold = IDLE_REWARM_AFTER
+
     now = time.perf_counter()
     with _activity_lock:
-        if now - _last_activity < IDLE_REWARM_AFTER:
+        if now - _last_activity < threshold:
             return False
-        # 立刻占位，避免连续按键触发多次预热
+        # 立刻占位，避免连续变化触发多次预热
         _last_activity = now
-    print("Idle detected; warming the connection up in the background.")
+    print(f"Idle > {threshold:.0f}s; warming the connection up in the background.")
     threading.Thread(target=warm_up, args=(config, '预热'), daemon=True).start()
     return True
 

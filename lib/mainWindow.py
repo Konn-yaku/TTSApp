@@ -65,10 +65,15 @@ class TTSApp:
         self.prompt_label.pack(pady=(0, 5))
 
         # --- 2. Entry: 文本输入框 ---
-        # 用 fill='x' 让它跟着窗口宽度伸展，比旧版固定 width=25 更好用
-        self.text_entry = tk.Entry(input_frame, font=("Microsoft YaHei UI", 10))
+        # 用 fill='x' 让它跟着窗口宽度伸展，比旧版固定 width=25 更好用。
+        # 绑一个 StringVar 是为了监听「框里出现文字」：不管是手打还是粘贴，
+        # 内容一变就能收到通知（只绑 <Key> 的话，右键粘贴那条路径会漏掉）。
+        self.text_var = tk.StringVar()
+        self.text_entry = tk.Entry(input_frame, font=("Microsoft YaHei UI", 10),
+                                   textvariable=self.text_var)
         self.text_entry.pack(fill='x', pady=(0, 6))
         self.text_entry.focus()  # 获得焦点
+        self.text_var.trace_add('write', self._on_entry_changed)
 
         checkbox_frame = tk.Frame(input_frame)
         checkbox_frame.pack()
@@ -129,24 +134,27 @@ class TTSApp:
         # --- 绑定回车键提交 ---
         self.text_entry.bind('<Return>', lambda event: self.submit_text(func, *args))
 
-        # --- 开始打字时补一次连接预热 ---
-        # 长停顿（实测 100-300 秒）之后服务端会把空闲连接关掉，那一句就得重新握手。
-        # 这里在你敲下第一个字时就后台补一条，等你打完按回车，连接通常已经建好。
-        # ensure_warm 内部自己节流，所以每次按键都调用它是安全的。
-        self.text_entry.bind('<Key>', self._maybe_prewarm)
+        # --- 输入框里一出现文字就补一次连接预热 ---
+        # 监听挂在上面 text_var 的 trace 上（见 _on_entry_changed）：
+        # 长停顿（实测 100-300 秒）之后服务端会把空闲连接关掉，那一句就得重新握手；
+        # 内容一变就后台补一条，等你按回车时连接通常已经建好。
 
         # --- 启动日志轮询 ---
         # 合成跑在工作线程里，只能先把日志放进队列，再由主线程取出来写控件
         self.root.after(100, self._pump_logs)
 
-    def _maybe_prewarm(self, event=None):
-        """用户开始打字时，给可能已经空闲失效的连接补一次预热。
+    def _on_entry_changed(self, *_args):
+        """输入框内容一变就调用：里面出现文字时，补一次连接预热。
 
+        监听「内容变化」而不是「按键」，是为了覆盖粘贴这条路径。
         ensure_warm 内部自己节流（只有空闲超过阈值才真正动手），
-        所以每次按键都调用它是安全的。
+        所以可以放心地在每次变化时调用，不会变成发请求的洪水。
         """
-        if self.config is not None:
-            ensure_warm(self.config)
+        if self.config is None:
+            return
+        if not self.text_var.get().strip():
+            return
+        ensure_warm(self.config)
 
     def _append_log(self, message):
         """把一行日志写入日志区（只能在主线程调用）。"""

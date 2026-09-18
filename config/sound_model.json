@@ -5,6 +5,7 @@
   "OUTPUT_FORMAT": "audio-24khz-48kbitrate-mono-mp3",
   "STORED_FILEPATH": "./cache",
   "WARM_CONNECTIONS": 2,
+  "IDLE_REWARM_SECONDS": 10,
   "VOICE": "zh-CN-XiaoxiaoNeural",
   "VOICE_STYLE": "general",
   "SPEED": 0,
