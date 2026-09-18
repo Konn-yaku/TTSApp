@@ -11,6 +11,7 @@ build/
 dist/
 *.spec
 app.exe
+TTSApp.zip
 
 # --- 运行时语音缓存（保留本地，不提交）---
 cache/*
