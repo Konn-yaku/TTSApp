@@ -429,7 +429,7 @@ def warm_up(config, tag='启动', count=None):
     ★ 这里等的就是「每条连接的响应头/正文」，不是「服务端算完」：
     只请求站点根路径（一个静态页面），不消耗任何语音合成配额。
 
-    tag:   日志前缀。启动是「启动」，空闲补热是「预热」，失败重连是「重连」。
+    tag:   终端日志前缀，区分是谁触发的：启动预热「启动」、停顿补热「预热」、失败重连「重连」。
     count: 建几条；默认读配置里的 WARM_CONNECTIONS。
     """
     note_activity()
@@ -467,12 +467,11 @@ def warm_up(config, tag='启动', count=None):
         if round_no < WARM_ATTEMPT_LIMIT:
             print(f"Connection warm-up got {ok}/{count}; topping up the rest.")
 
+    # 连接信息只在终端输出，界面上不再显示
     if ok:
-        print(f"TTS connection warmed up ({ok}/{count}).")
-        emit_log(f"[{tag}] TTS 连接已预热")
+        print(f"[{tag}] TTS connection warmed up ({ok}/{count}).")
     else:
-        print("Connection warm-up skipped.")
-        emit_log(f"[{tag}] 连接预热失败，不影响使用")
+        print(f"[{tag}] Connection warm-up skipped.")
 
 
 def ensure_warm(config):
