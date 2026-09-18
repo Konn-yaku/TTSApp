@@ -4,6 +4,7 @@
   "API_KEY": "9cua5sn8cb385bza27gjgca5sjx8rwfn",
   "OUTPUT_FORMAT": "audio-24khz-48kbitrate-mono-mp3",
   "STORED_FILEPATH": "./cache",
+  "WARM_CONNECTIONS": 2,
   "VOICE": "zh-CN-XiaoxiaoNeural",
   "VOICE_STYLE": "general",
   "SPEED": 0,

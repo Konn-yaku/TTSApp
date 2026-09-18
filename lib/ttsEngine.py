@@ -147,6 +147,21 @@ ATTEMPT_TIMEOUT = 3.0   # 单次尝试的累计上限（从发出请求算起）
 REQUEST_BUDGET = 5.0    # 整个请求（含重发）的总预算，硬上限
 ATTEMPT_LIMIT = 2       # 最多尝试几次
 
+# --- 连接预热 ---
+# 预热条数。优先读配置里的 WARM_CONNECTIONS，没有这一项时用下面的默认值
+# （这样旧配置文件不会导致启动失败）。
+#
+# 它指的是「同时在跑的合成句数上限」，不是「每句一条」：
+# 一句合成完就把连接还回池子，只要同时在跑的请求不超过这个数，
+# 之后每一句都能复用暖连接。实测池里只有 1 条时，3 次并发请求
+# 会额外新建 3 条冷连接；而冷连接要重新握手（实测 +0.7 到 4 秒）。
+DEFAULT_WARM_CONNECTIONS = 2
+
+# 空闲超过这么久，就认为池子里的连接可能已被服务端关掉，
+# 于是在「用户开始打字」时补一次预热。
+# 实测：空闲 100 秒仍能复用，空闲 300 秒已被关闭 ⇒ 超时在 100-300 秒之间。
+IDLE_REWARM_AFTER = 100.0
+
 # 全局复用的 HTTP 会话。
 # 复用 TCP/TLS 连接，避免每次请求都重新握手（实测每次新建连接需 2-4 秒）。
 _http = requests.Session()
@@ -307,28 +322,126 @@ _playback_thread = threading.Thread(target=_playback_worker, daemon=True)
 _playback_thread.start()
 
 
-def warm_up(config, tag='启动'):
+# 最近一次与服务器交互的时刻，以及它的锁。
+# ensure_warm 靠它判断「是不是已经空闲太久了」。
+_last_activity = time.perf_counter()
+_activity_lock = threading.Lock()
+
+
+def note_activity():
+    """记下「刚刚和服务器交互过」，供 ensure_warm 判断是否该补预热。"""
+    global _last_activity
+    with _activity_lock:
+        _last_activity = time.perf_counter()
+
+
+def _warm_one(config, barrier, results):
+    """建立一条连接。
+
+    先只拿到响应头（此时这条连接已从池子里「借出」），再在 barrier 处与会合，
+    这样能保证 count 条连接确实同时被借出、各自新建（理由见 warm_up）。
+    会合之后才读完正文，把连接归还给连接池。
+    """
+    try:
+        # stream=True：先只要响应头，让连接保持「已借出」状态
+        response = _http.get(config.BASE_URL, timeout=10, stream=True)
+    except Exception as e:
+        print(f"Connection warm-up failed: {e}")
+        results.append(False)
+        try:
+            barrier.abort()  # 别让其它线程白等
+        except Exception:
+            pass
+        return
+
+    try:
+        try:
+            barrier.wait(timeout=10)
+        except threading.BrokenBarrierError:
+            pass
+        # 必须读完正文，否则连接不会被归还到连接池
+        response.content
+        results.append(True)
+    except Exception as e:
+        print(f"Connection warm-up failed while reading body: {e}")
+        results.append(False)
+    finally:
+        response.close()
+
+
+def warm_up(config, tag='启动', count=None):
     """提前建立与 TTS 服务的 TCP/TLS 连接，供后续合成请求复用。
 
     只请求站点根路径（一个静态页面），不消耗任何语音合成配额。
     失败会被吞掉 —— 预热失败只会损失部分优化收益，不影响正常功能。
 
-    tag: 日志前缀。启动时是「启动」，请求失败后重连时是「重连」。
+    ★ 为什么要「并发」建 count 条，而不是串行请求 count 次：
+    连接池把空闲连接存在一个队列里。串行请求时，第 1 次建立的连接会被
+    第 2 次直接取走复用，最后池里依然只有 1 条。只有让 count 个请求
+    同时「借出」连接，它们才会各自新建一条。
+
+    ★ count 是「同时在跑的句数上限」，不是「每句一条」：
+    请求结束后连接会归还池子，只要并发不超过 count 条，之后每一句都能复用。
+
+    tag:   日志前缀。启动是「启动」，空闲补热是「预热」，失败重连是「重连」。
+    count: 建几条；默认读配置里的 WARM_CONNECTIONS。
     """
+    note_activity()
+
+    if count is None:
+        count = getattr(config, 'WARM_CONNECTIONS', DEFAULT_WARM_CONNECTIONS)
     try:
-        # 默认 stream=False，会完整读取响应并把连接归还到连接池
-        _http.get(config.BASE_URL, timeout=10)
-        print("TTS connection warmed up.")
+        count = max(1, int(count))
+    except (TypeError, ValueError):
+        print(f"Invalid WARM_CONNECTIONS={count!r}; using {DEFAULT_WARM_CONNECTIONS}.")
+        count = DEFAULT_WARM_CONNECTIONS
+
+    results = []
+    barrier = threading.Barrier(count)
+    threads = [threading.Thread(target=_warm_one,
+                               args=(config, barrier, results),
+                               daemon=True)
+               for _ in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    ok = sum(1 for r in results if r)
+    if ok:
+        print(f"TTS connection warmed up ({ok}/{count}).")
         emit_log(f"[{tag}] TTS 连接已预热")
-    except Exception as e:
-        print(f"Connection warm-up skipped: {e}")
+    else:
+        print("Connection warm-up skipped.")
         emit_log(f"[{tag}] 连接预热失败，不影响使用")
+
+
+def ensure_warm(config):
+    """空闲太久时补一次预热 —— 供界面在「用户开始打字」时调用。
+
+    内部自己节流：只有距上次网络活动超过 IDLE_REWARM_AFTER 秒才真正动手，
+    所以每次按键都调用它是安全的，不会变成发请求的洪水。
+
+    实测服务端会在 100-300 秒之间把空闲连接关掉。在你开始打字时补一条，
+    等你打完按回车，连接通常已经建好（握手约 0.7 秒），这一句就是热的。
+    空闲不输入时不会产生任何请求。
+    """
+    global _last_activity
+    now = time.perf_counter()
+    with _activity_lock:
+        if now - _last_activity < IDLE_REWARM_AFTER:
+            return False
+        # 立刻占位，避免连续按键触发多次预热
+        _last_activity = now
+    print("Idle detected; warming the connection up in the background.")
+    threading.Thread(target=warm_up, args=(config, '预热'), daemon=True).start()
+    return True
 
 
 def _rewarm_in_background(config):
     """请求失败后在后台重新预热连接。
 
-    超时或连接中断可能让连接池里那条复用的连接失效，这里提前补一条，
+    超时或连接中断可能让池子里那条复用的连接失效，这里提前补回来，
     免得下一句又要付一次 TCP/TLS 握手成本。
     这个动作不依赖「连接到底丢没丢」的判断，无论丢没丢都是安全的。
     """
@@ -401,6 +514,9 @@ def text_to_speech_web_api(text, config):
     #   非 200                                              -> 不重发（请求本身有问题）
     # 重发不会造成「播放两遍」：只有完整拿到音频字节才会交给播放队列，
     # 被放弃的那次响应对象直接丢弃，永远进不了队列。
+    # 马上要和服务器交互了，记一笔，供 ensure_warm 判断空闲时长
+    note_activity()
+
     request_started = time.perf_counter()
     budget_deadline = request_started + REQUEST_BUDGET
     last_failure = None

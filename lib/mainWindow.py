@@ -2,7 +2,7 @@ import tkinter as tk
 import win32gui
 import win32con
 from lib.globalHotkeyManager import GlobalHotkeyManager
-from lib.ttsEngine import poll_logs
+from lib.ttsEngine import ensure_warm, poll_logs
 
 
 class DraggableWindow(tk.Tk):
@@ -43,6 +43,8 @@ class TTSApp:
 
     def __init__(self, root, hotkey_manager, func, *args):
         self.root = root
+        # args 是传给 func 的额外参数；按 app.py 的调用方式，args == (config,)
+        self.config = args[0] if args else None
         self.root.title("tts")
         self.root.geometry("560x420")  # 上半部分是输入区，下半部分是合成日志
         self.root.resizable(False, False)  # 通常这类小工具窗口不可调整大小
@@ -127,9 +129,24 @@ class TTSApp:
         # --- 绑定回车键提交 ---
         self.text_entry.bind('<Return>', lambda event: self.submit_text(func, *args))
 
+        # --- 开始打字时补一次连接预热 ---
+        # 长停顿（实测 100-300 秒）之后服务端会把空闲连接关掉，那一句就得重新握手。
+        # 这里在你敲下第一个字时就后台补一条，等你打完按回车，连接通常已经建好。
+        # ensure_warm 内部自己节流，所以每次按键都调用它是安全的。
+        self.text_entry.bind('<Key>', self._maybe_prewarm)
+
         # --- 启动日志轮询 ---
         # 合成跑在工作线程里，只能先把日志放进队列，再由主线程取出来写控件
         self.root.after(100, self._pump_logs)
+
+    def _maybe_prewarm(self, event=None):
+        """用户开始打字时，给可能已经空闲失效的连接补一次预热。
+
+        ensure_warm 内部自己节流（只有空闲超过阈值才真正动手），
+        所以每次按键都调用它是安全的。
+        """
+        if self.config is not None:
+            ensure_warm(self.config)
 
     def _append_log(self, message):
         """把一行日志写入日志区（只能在主线程调用）。"""
