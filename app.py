@@ -17,6 +17,7 @@ if __name__ == '__main__':
     # （TTSApp 初始化时该勾选框默认为未勾选，会主动 stop 监听器）
     root = lib.mainWindow.DraggableWindow()  # 使用可拖拽的窗口类
     app = lib.mainWindow.TTSApp(root, hotkey_manager, lib.ttsEngine.text_to_speech, config)  # 创建应用
+    lib.ttsEngine.emit_log("[启动] 程序已就绪")
     root.mainloop()
     # 退出顺序：先停快捷键监听，再停播放线程与 mixer
     hotkey_manager.stop()

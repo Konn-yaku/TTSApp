@@ -1,6 +1,6 @@
 import json
 from pynput import keyboard
-from lib.ttsEngine import resolve_path, text_to_speech
+from lib.ttsEngine import emit_log, resolve_path, text_to_speech
 
 
 class GlobalHotkeyManager:
@@ -93,6 +93,7 @@ class GlobalHotkeyManager:
         # 如果没有有效的快捷键，不启动监听器
         if not hotkey_callbacks:
             print("No valid hotkeys loaded. Listener not started.")
+            emit_log("[快捷键] 配置为空，未启用")
             return
 
         try:
@@ -101,10 +102,12 @@ class GlobalHotkeyManager:
             self.listener = keyboard.GlobalHotKeys(hotkey_callbacks)
             self.listener.start()
             print("Global hotkey listener started.")
+            emit_log(f"[快捷键] 已启用（{len(hotkey_callbacks)} 个）")
             # 通常不需要 join()，除非你想阻塞主线程
             # self.listener.join()
         except Exception as e:
             print(f"Failed to start global hotkey listener: {e}")
+            emit_log("[失败] 快捷键启动失败")
             self.listener = None
 
     def stop(self):
@@ -113,6 +116,7 @@ class GlobalHotkeyManager:
             self.listener.stop()
             self.listener = None
             print("Global hotkey listener stopped.")
+            emit_log("[快捷键] 已停用")
 
     def reload_shortcuts(self):
         """重新加载快捷键配置文件。"""

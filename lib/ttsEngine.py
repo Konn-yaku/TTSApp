@@ -30,6 +30,34 @@ def resolve_path(path):
     return path if path.is_absolute() else APP_ROOT / path
 
 
+# --- 界面日志 ---
+# 合成跑在工作线程里，而 Tkinter 只能在主线程操作，直接写控件会崩。
+# 所以工作线程只往队列里放文本，由界面主线程定时取出写进文本框。
+_log_queue = queue.Queue()
+
+
+def emit_log(message):
+    """推送一条日志给界面显示。任意线程都可以安全调用。"""
+    _log_queue.put(message)
+
+
+def poll_logs(max_items=100):
+    """取出待显示的日志（最多 max_items 条）。仅供界面主线程调用。"""
+    messages = []
+    for _ in range(max_items):
+        try:
+            messages.append(_log_queue.get_nowait())
+        except queue.Empty:
+            break
+    return messages
+
+
+def _brief(text, limit=20):
+    """缩短文本用于日志显示，避免长句把日志行撑爆。"""
+    text = text.replace('\n', ' ')
+    return text if len(text) <= limit else text[:limit] + '…'
+
+
 # --- 配置 ---
 class Config:
     def __init__(self, *config_path):
@@ -99,9 +127,11 @@ def _playback_worker():
     """播放队列中的音频文件的工作线程。"""
     while not _stop_playback.is_set():
         try:
-            # 从队列中获取下一个任务：(文件路径, 入队时刻, 请求发出时刻)
+            # 从队列中获取下一个任务：
+            # (文件路径, 入队时刻, 请求发出时刻, 音频就绪耗时, 该耗时的名称)
             # block=True, timeout=1.0 避免无限阻塞，允许检查 _stop_playback
-            mp3_file_path, queued_at, requested_at = _playback_queue.get(timeout=1.0)
+            (mp3_file_path, queued_at, requested_at,
+             ready_ms, ready_label) = _playback_queue.get(timeout=1.0)
 
             # 处理获取到的路径
             file_path = Path(mp3_file_path)
@@ -133,6 +163,8 @@ def _playback_worker():
                 if requested_at is not None:
                     print(f"[TTS]   按键 → 出声   {(t_playing - requested_at) * 1000:.0f} ms")
 
+                emit_log("[播放] 开始")
+
                 # 等待播放完成
                 while pygame.mixer.music.get_busy() and not _stop_playback.is_set():
                     time.sleep(0.1)
@@ -141,6 +173,19 @@ def _playback_worker():
                 if _stop_playback.is_set():
                     pygame.mixer.music.stop()
                     print("Playback stopped by shutdown signal.")
+
+                emit_log("[播放] 结束")
+
+                # 三项耗时先各自取整再相加5作为总数，这样「总数 = 各项之和」
+                # 在界面上永远成立（与真实耗时的差在 1 ms 以内）
+                decode_ms = round((t_loaded - t_load) * 1000)
+                queue_ms = round((t_playing - queued_at) * 1000) - decode_ms
+                if ready_ms is not None:
+                    ready_ms = round(ready_ms)
+                    emit_log(f"[延迟] 按键 → 出声  {ready_ms + queue_ms + decode_ms} ms")
+                    emit_log(f"        （{ready_label} {ready_ms} ｜ 排队 {queue_ms} ｜ 解码 {decode_ms}）")
+                else:
+                    emit_log(f"[延迟] 入队 → 出声  {queue_ms + decode_ms} ms")
 
                 print(f"Finished playing: {file_path}")
 
@@ -177,8 +222,10 @@ def warm_up(config):
         # 默认 stream=False，会完整读取响应并把连接归还到连接池
         _http.get(config.BASE_URL, timeout=10)
         print("TTS connection warmed up.")
+        emit_log("[启动] TTS 连接已预热")
     except Exception as e:
         print(f"Connection warm-up skipped: {e}")
+        emit_log("[启动] 连接预热失败，不影响使用")
 
 
 def text_to_speech_web_api(text, config):
@@ -248,6 +295,7 @@ def text_to_speech_web_api(text, config):
         # 4. 检查响应状态
         if response.status_code != 200:
             print(f"TTS API Error: {response.status_code} - {response.text}")
+            emit_log(f"[失败] 服务端返回 {response.status_code}")
             return None
 
         # 5. 读取响应体
@@ -261,6 +309,8 @@ def text_to_speech_web_api(text, config):
 
     except requests.exceptions.RequestException as e:
         print(f"Request failed: {e}")
+        # 界面只报异常类型名，完整信息留给控制台，避免把日志行撑爆
+        emit_log(f"[失败] 网络异常（{type(e).__name__}）")
         return None
 
 
@@ -285,16 +335,19 @@ def save_audio_to_file(audio_bytes, config, filename):
     except OSError as e:
         # 磁盘满 / 无写入权限等：只让本次失败，不能让异常冒泡把请求线程带走
         print(f"缓存写入失败：{e}")
+        emit_log("[失败] 缓存写入失败")
         return False
 
 
-def play_in_background_queued(mp3_path, requested_at=None):
+def play_in_background_queued(mp3_path, requested_at=None, ready_ms=None, ready_label='合成'):
     """将播放请求添加到队列中。
 
     requested_at: 用户触发本次请求（按回车 / 按热键）的时刻，
                   用于统计「按键 → 出声」的端到端延迟。
+    ready_ms:     从 requested_at 到音频就绪（已落盘 / 已命中缓存）的耗时。
+    ready_label:  上述耗时在界面上的名称：「合成」或「命中」。
     """
-    _playback_queue.put((mp3_path, time.perf_counter(), requested_at))
+    _playback_queue.put((mp3_path, time.perf_counter(), requested_at, ready_ms, ready_label))
     print(f"Queued for playback: {mp3_path}")
 
 
@@ -319,11 +372,14 @@ def text_to_speech(text, config):
         # 如果缓存文件存在，将其加入播放队列
         if cache_file_path.exists():
             print("[TTS] 缓存命中")
-            play_in_background_queued(cache_file_path, requested_at)
+            emit_log("[缓存] 命中，跳过合成")
+            play_in_background_queued(cache_file_path, requested_at,
+                                      (time.perf_counter() - requested_at) * 1000, '命中')
             return
 
         # 缓存不存在，生成音频
         print("[TTS] 缓存未命中，开始合成")
+        emit_log(f"[合成] 开始：「{_brief(text)}」")
         audio_data = text_to_speech_web_api(text, config)
         if audio_data is None:
             print("[TTS] 合成失败：本次没有拿到音频")
@@ -336,8 +392,13 @@ def text_to_speech(text, config):
             print("[TTS] 写盘失败：本次无音频可播放")
             return
 
+        # 「合成」耗时从用户按键算起，到音频落盘完成为止。
+        # 这样它加上「排队」「解码」正好等于端到端总耗时（见 _playback_worker）
+        ready_ms = (time.perf_counter() - requested_at) * 1000
+        emit_log(f"[合成] 完成  {ready_ms:.0f} ms")
+
         # 只有确实拿到音频文件才加入播放队列
-        play_in_background_queued(cache_file_path, requested_at)
+        play_in_background_queued(cache_file_path, requested_at, ready_ms, '合成')
 
     thread = threading.Thread(target=target, args=(text, config), daemon=True)
     thread.start()
