@@ -157,6 +157,31 @@ ATTEMPT_LIMIT = 2       # 最多尝试几次
 # 会额外新建 3 条冷连接；而冷连接要重新握手（实测 +0.7 到 4 秒）。
 DEFAULT_WARM_CONNECTIONS = 2
 
+# 预热自己的时间约束（口径与请求路径的 CONNECT_TIMEOUT / ATTEMPT_TIMEOUT 对齐）。
+#
+# 为什么必须单独一套：预热原本直接写死 timeout=10，比真实请求路径（3 秒）还宽松 3 倍多。
+# 而预热打的站点根路径实测约 1/8 的概率「完全不响应」（有一次 >11.9 秒才被判超时），
+# 结果一条卡住的连接就把整条预热拖到十几秒之后才结束 —— 日志乱序，
+# 还白丢一条连接（2 条只建成 1 条，终端显示 `warmed up (1/2)`）。
+#
+# 连接超时取 4 秒（比请求路径的 2 秒宽）：预热建的是**全新**连接，
+# 要现做 DNS + TCP + TLS，实测量到的响应头耗时是 1.2–2.6 秒
+# （这是「连接 + 请求 + 等响应头」的合计）。用 2 秒会误杀 ——
+# 实测 3 次预热里出现 3 次 `connect timeout=2.0`。
+WARM_CONNECT_TIMEOUT = 4.0
+# 读超时沿用请求路径的量级：实测站点根路径的正常响应慢到过 3.1 秒。
+WARM_READ_TIMEOUT = 5.0
+# 注：两个值都真的生效（connect 管建连，read 管读；实测传 (3.0, 9.0) 时
+# 连接对象上的 socket 超时就是 9.0）。但「建连阶段」的卡死会被 urllib3 报成
+# `Read timed out. (read timeout=<connect 值>)` —— 标签会骗人，数字与这里对不上时以这里为准。
+# 整条预热最多跑几轮。一轮里有连接失败就再跑一轮补齐 ——
+# 补的那一轮里，成功的槽位会复用池里的连接，只有缺的那条会新建，所以补完仍是 count 条。
+WARM_ATTEMPT_LIMIT = 2
+# 整条预热的硬上限，到点收工，不再补。
+# 必须留得下「补一轮」的余地：第一轮最坏要 4 秒连接 + 5 秒读 ≈ 9 秒，
+# 预算太紧就等于把补的那一轮挤掉了。
+WARM_BUDGET = 10.0
+
 # 空闲超过这么久，就认为池子里的连接可能已被服务端关掉，
 # 于是在「输入框里出现文字」时补一次预热。
 # 实测：空闲 100 秒仍能复用，空闲 300 秒已被关闭 ⇒ 超时在 100-300 秒之间。
@@ -339,28 +364,37 @@ def note_activity():
         _last_activity = time.perf_counter()
 
 
-def _warm_one(config, barrier, results):
+def _warm_one(config, barrier, results, deadline):
     """建立一条连接。
 
     先只拿到响应头（此时这条连接已从池子里「借出」），再在 barrier 处与会合，
-    这样能保证 count 条连接确实同时被借出、各自新建（理由见 warm_up）。
+    这样能保证同一轮的 count 条连接确实同时被借出、各自新建（理由见 warm_up）。
     会合之后才读完正文，把连接归还给连接池。
+
+    deadline：整条预热的硬上限。超时值还要再和剩余预算取小，
+    免得某一轮把预算吃光（和请求路径对 timeout 的处理一致）。
     """
+    remaining = max(0.1, deadline - time.perf_counter())
     try:
         # stream=True：先只要响应头，让连接保持「已借出」状态
-        response = _http.get(config.BASE_URL, timeout=10, stream=True)
+        response = _http.get(
+            config.BASE_URL,
+            timeout=(min(WARM_CONNECT_TIMEOUT, remaining),
+                     min(WARM_READ_TIMEOUT, remaining)),
+            stream=True,
+        )
     except Exception as e:
         print(f"Connection warm-up failed: {e}")
         results.append(False)
         try:
-            barrier.abort()  # 别让其它线程白等
+            barrier.abort()  # 别让同一轮的其它线程白等
         except Exception:
             pass
         return
 
     try:
         try:
-            barrier.wait(timeout=10)
+            barrier.wait(timeout=WARM_READ_TIMEOUT)
         except threading.BrokenBarrierError:
             pass
         # 必须读完正文，否则连接不会被归还到连接池
@@ -387,6 +421,14 @@ def warm_up(config, tag='启动', count=None):
     ★ count 是「同时在跑的句数上限」，不是「每句一条」：
     请求结束后连接会归还池子，只要并发不超过 count 条，之后每一句都能复用。
 
+    ★ 一轮里有连接失败就再补一轮（最多 WARM_ATTEMPT_LIMIT 轮）：
+    失败的连接不会进池子，于是 2 条只建成 1 条（实测概率约 1/8）。
+    补的那一轮里，成功的槽位会复用池里已有的连接，只有缺的那条会真的新建，
+    所以补完仍然是 count 条 —— 不会重复建。总耗时受 WARM_BUDGET 约束。
+
+    ★ 这里等的就是「每条连接的响应头/正文」，不是「服务端算完」：
+    只请求站点根路径（一个静态页面），不消耗任何语音合成配额。
+
     tag:   日志前缀。启动是「启动」，空闲补热是「预热」，失败重连是「重连」。
     count: 建几条；默认读配置里的 WARM_CONNECTIONS。
     """
@@ -400,18 +442,31 @@ def warm_up(config, tag='启动', count=None):
         print(f"Invalid WARM_CONNECTIONS={count!r}; using {DEFAULT_WARM_CONNECTIONS}.")
         count = DEFAULT_WARM_CONNECTIONS
 
-    results = []
-    barrier = threading.Barrier(count)
-    threads = [threading.Thread(target=_warm_one,
-                               args=(config, barrier, results),
-                               daemon=True)
-               for _ in range(count)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
+    deadline = time.perf_counter() + WARM_BUDGET
+    ok = 0
+    for round_no in range(1, WARM_ATTEMPT_LIMIT + 1):
+        if time.perf_counter() >= deadline:
+            print("Connection warm-up out of budget; stopping.")
+            break
+        results = []
+        barrier = threading.Barrier(count)
+        threads = [threading.Thread(target=_warm_one,
+                                    args=(config, barrier, results, deadline),
+                                    daemon=True)
+                   for _ in range(count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            # 用「剩余预算」而不是固定值来等：这样整条预热的耗时真的被
+            # WARM_BUDGET 兜住（按线程数逐个 join 固定值会叠加成 N 倍预算）。
+            t.join(timeout=max(0.1, deadline - time.perf_counter()))
 
-    ok = sum(1 for r in results if r)
+        ok = sum(1 for r in results if r)
+        if ok >= count:
+            break
+        if round_no < WARM_ATTEMPT_LIMIT:
+            print(f"Connection warm-up got {ok}/{count}; topping up the rest.")
+
     if ok:
         print(f"TTS connection warmed up ({ok}/{count}).")
         emit_log(f"[{tag}] TTS 连接已预热")
