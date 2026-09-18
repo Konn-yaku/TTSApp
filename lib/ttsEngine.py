@@ -288,63 +288,6 @@ def save_audio_to_file(audio_bytes, config, filename):
         return False
 
 
-def play_mp3_file(mp3_file_path):
-    """
-    播放指定的 MP3 文件。
-
-    Args:
-        mp3_file_path (str or Path): MP3 文件的路径。
-
-    Returns:
-        bool: 播放成功返回 True，失败返回 False。
-    """
-    # 确保路径是 Path 对象以便检查
-    file_path = Path(mp3_file_path)
-
-    # 1. 等待文件出现
-    while not file_path.exists():
-        pass
-
-    if not file_path.is_file():
-        print(f"Error: Path is not a file: {file_path}")
-        return False
-
-    # 2. 初始化 pygame mixer (如果尚未初始化)
-    # 这通常只需要在整个程序启动时做一次
-    # 如果 mixer 已经初始化，再次调用 init() 通常无害，但最好检查一下
-    if not pygame.mixer.get_init():
-        try:
-            # 根据您的音频文件调整参数 (可选，通常不指定也能工作)
-            # frequency: 音频采样率, size: 位深度, channels: 声道数
-            pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
-            print("Pygame mixer initialized.")
-        except pygame.error as e:
-            print(f"Failed to initialize pygame mixer: {e}")
-            return False
-
-    try:
-        # 3. 加载 MP3 文件
-        pygame.mixer.music.load(file_path)
-
-        # 4. 播放音频
-        pygame.mixer.music.play()
-
-        # 5. 等待播放完成 (阻塞当前线程)
-        # 这个循环检查 mixer 是否还在忙于播放
-        while pygame.mixer.music.get_busy():
-            time.sleep(0.1)  # 小休一下，避免占用过多CPU
-
-        print(f"Playback finished: {file_path}")
-        return True
-
-    except pygame.error as e:
-        print(f"Pygame error playing {file_path}: {e}")
-        return False
-    except Exception as e:
-        print(f"Unexpected error playing {file_path}: {e}")
-        return False
-
-
 def play_in_background_queued(mp3_path, requested_at=None):
     """将播放请求添加到队列中。
 
