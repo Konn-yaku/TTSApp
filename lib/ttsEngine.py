@@ -1,4 +1,5 @@
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -136,6 +137,9 @@ _stop_playback = threading.Event()
 # 而「写临时文件 + os.replace」是两步，不加锁时第二步会撞上 [WinError 5] 拒绝访问
 # （实测可出现）。单次写入只有 1 ms 左右，串行化的代价可以忽略。
 _save_lock = threading.Lock()
+
+# 请求序号。每条请求的日志都以一行分隔标题开头，方便在界面上区分彼此。
+_request_seq = itertools.count(1)
 
 
 def _playback_worker():
@@ -455,6 +459,9 @@ def text_to_speech(text, config):
         cache_dir = Path(config.STORED_FILEPATH)
         cache_file_path = cache_dir / f"{hashed_text}.mp3"
 
+        # 分隔标题：一条请求的日志从这里开始，方便在界面上区分前后两条
+        emit_log(f"---- 第 {next(_request_seq)} 条：「{_brief(text)}」 ----")
+
         # 如果缓存文件存在，将其加入播放队列
         if cache_file_path.exists():
             print("[TTS] 缓存命中")
@@ -465,7 +472,7 @@ def text_to_speech(text, config):
 
         # 缓存不存在，生成音频
         print("[TTS] 缓存未命中，开始合成")
-        emit_log(f"[合成] 开始：「{_brief(text)}」")
+        emit_log("[合成] 开始")
         audio_data = text_to_speech_web_api(text, config)
         if audio_data is None:
             print("[TTS] 合成失败：本次没有拿到音频")
