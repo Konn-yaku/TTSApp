@@ -1,4 +1,3 @@
-import collections
 import hashlib
 import itertools
 import json
@@ -136,24 +135,48 @@ def search_word_replacement(text, config):
 # --- 配置结束 ---
 
 # --- 请求超时（秒）---
-# READ_TIMEOUT 是「相邻两次收到数据之间」的最长间隔，不是整个请求的总时长上限。
-# 取 2 秒的依据：连接复用时实测 20 次「等待响应首字节」，中位数 417 ms、最大 1501 ms，
-# 约留有 33% 余量。超时后界面会明确报错，再按一次回车即可重试。
-CONNECT_TIMEOUT = 2.0
-READ_TIMEOUT = 2.0
+# 实测依据（2026-09-19，50 次真实合成，热连接，全部成功）：
+#   等待首字节   p50 382 / p95 887  / max 1206 ms
+#   接收正文     p50  22 / p95 217  / max  219 ms
+#   单次尝试合计 p50 406 / p95 1105 / max 1425 ms
+# 所以单次尝试给 3 秒约有 1 倍余量（50 次里触发 0 次），不会误杀正常请求。
+# 之前取的 2 秒反而过紧：实测有一次 2003 ms 本可一次成功，却被 2 秒掐断后重发，
+# 该请求总耗时反而涨到 3202 ms。
+CONNECT_TIMEOUT = 2.0   # 建立连接（TCP/TLS 握手）最多等多久
+ATTEMPT_TIMEOUT = 3.0   # 单次尝试的累计上限（从发出请求算起）；超过即中止并重发
+REQUEST_BUDGET = 5.0    # 整个请求（含重发）的总预算，硬上限
+ATTEMPT_LIMIT = 2       # 最多尝试几次
 
 # 全局复用的 HTTP 会话。
 # 复用 TCP/TLS 连接，避免每次请求都重新握手（实测每次新建连接需 2-4 秒）。
 _http = requests.Session()
 
-# 创建一个全局的播放队列
+# 创建一个全局的播放队列。
+# 队列里排的是「输入顺序」的占位，而不是「合成完成顺序」的成品 —— 见 _PendingSpeech。
 _playback_queue = queue.Queue()
 
-# 一条待播放任务。用命名元组而不是裸元组：字段已经有 6 个，位置很容易记错。
-_PlaybackTask = collections.namedtuple(
-    '_PlaybackTask',
-    ['path', 'queued_at', 'requested_at', 'ready_ms', 'ready_label', 'index'],
-)
+
+class _PendingSpeech:
+    """一条已提交、但音频可能还没就绪的播放任务。
+
+    为什么要在「提交的那一刻」就入队，而不是等合成完成才入队：
+    合成是在各自的线程里并行跑的，谁先跑完谁先入队，于是短句会插到长句前面，
+    播放顺序就和输入顺序不一致了（用户实测：先输 1234567 再输 1，结果是 1 先播）。
+    现在队列里排的是「输入顺序」，音频就绪后再回填内容。
+    """
+
+    __slots__ = ('index', 'requested_at', 'ready', 'ready_at',
+                 'path', 'ready_ms', 'ready_label', 'error')
+
+    def __init__(self, index, requested_at):
+        self.index = index
+        self.requested_at = requested_at
+        self.ready = threading.Event()  # 音频就绪（或确定没有音频）时被 set
+        self.ready_at = None            # 音频就绪的时刻
+        self.path = None                # 要播放的文件；None 表示这条没有音频
+        self.ready_ms = None            # requested_at → ready_at 的耗时
+        self.ready_label = '合成'
+        self.error = None               # 没有音频的原因（只写控制台）
 
 # 播放线程的控制事件
 _stop_playback = threading.Event()
@@ -174,19 +197,40 @@ def _playback_worker():
         try:
             # 从队列中获取下一个任务。block=True, timeout=1.0 避免无限阻塞，
             # 以便周期性检查 _stop_playback
-            task = _playback_queue.get(timeout=1.0)
-            mp3_file_path = task.path
-            queued_at = task.queued_at
-            requested_at = task.requested_at
-            ready_ms = task.ready_ms
-            ready_label = task.ready_label
+            pending = _playback_queue.get(timeout=1.0)
             # 之后本线程发出的日志（播放开始/结束、延迟）都会带上这条请求的编号
-            set_request_index(task.index)
+            set_request_index(pending.index)
+
+            # 队列里排的是「输入顺序」，但音频可能还没合成好，这里要等它就绪。
+            # 用 0.2 秒轮询而不是无限等待，便于及时响应退出；
+            # Event.wait 一旦被 set 会立刻返回，所以不会引入额外延迟。
+            while not pending.ready.is_set():
+                if _stop_playback.is_set():
+                    break
+                pending.ready.wait(0.2)
+
+            if not pending.ready.is_set():
+                print(f"Abandoned pending speech #{pending.index} (shutting down).")
+                _playback_queue.task_done()
+                continue
+
+            # 没有音频（合成失败 / 写盘失败）就跳过这一条，继续处理下一条。
+            # 失败原因已经在合成阶段报过了，这里不再重复刷界面。
+            if pending.path is None:
+                print(f"Request #{pending.index} has no audio to play: {pending.error}")
+                _playback_queue.task_done()
+                continue
+
+            mp3_file_path = pending.path
+            requested_at = pending.requested_at
+            ready_ms = pending.ready_ms
+            ready_label = pending.ready_label
 
             # 处理获取到的路径
             file_path = Path(mp3_file_path)
             if not file_path.exists() or not file_path.is_file():
                 print(f"Playback Error: File not found or invalid: {file_path}")
+                emit_log("[失败] 音频文件不存在")
                 _playback_queue.task_done()  # 标记此任务完成
                 continue
 
@@ -208,7 +252,7 @@ def _playback_worker():
                 pygame.mixer.music.play()
                 t_playing = time.perf_counter()
 
-                print(f"[TTS]   入队 → 出声   {(t_playing - queued_at) * 1000:.0f} ms"
+                print(f"[TTS]   就绪 → 出声   {(t_playing - pending.ready_at) * 1000:.0f} ms"
                       f"（解码 {(t_loaded - t_load) * 1000:.0f} ms）")
                 if requested_at is not None:
                     print(f"[TTS]   按键 → 出声   {(t_playing - requested_at) * 1000:.0f} ms")
@@ -228,8 +272,9 @@ def _playback_worker():
 
                 # 三项耗时先各自取整再相加作为总数，这样「总数 = 各项之和」
                 # 在界面上永远成立（与真实耗时的差在 1 ms 以内）
+                # 「排队」从音频就绪那一刻算起，因此它真实反映「在等前一句播完」的时间
                 decode_ms = round((t_loaded - t_load) * 1000)
-                queue_ms = round((t_playing - queued_at) * 1000) - decode_ms
+                queue_ms = round((t_playing - pending.ready_at) * 1000) - decode_ms
                 if ready_ms is not None:
                     ready_ms = round(ready_ms)
                     emit_log(f"[延迟] 按键 → 出声  {ready_ms + queue_ms + decode_ms} ms")
@@ -343,29 +388,39 @@ def text_to_speech_web_api(text, config):
 
     # 3. 发送请求并读完整正文（复用 _http 的持久连接，省去 TCP/TLS 握手）
     #
-    # 失败时最多重发一次，目的就是「不让用户再手动按一次回车」：
-    #   ReadTimeout     -> 重发。服务端偶发卡顿。
-    #   ConnectionError -> 重发。多半是连接池里残留的、已被服务端关闭的连接，
-    #                      请求根本没送达，重发几乎必然成功。
-    #   ConnectTimeout  -> 重发。握手超时可能只是网络抖动。
-    #   非 200          -> 不重发。请求本身有问题，重发结果一样。
+    # 两层时间约束，缺一不可：
+    #   ATTEMPT_TIMEOUT —— 单次尝试：从发出请求累计超过 3 秒就中止并重发
+    #   REQUEST_BUDGET  —— 整个请求（含重发）总预算 5 秒，超了直接放弃
+    # 为什么光靠读超时不够：读超时管的是「相邻两次收数据之间的间隔」。
+    # 若服务端每隔 1.9 秒吐一点点数据，每次间隔都没超时，但永远也收不完。
+    # 那种情况只有「累计计时」能兜住，所以正文必须逐块读（见下）。
     #
-    # 选择「宁可多发一次」：多发一次几乎没有成本（免费额度，不额外计费），
-    # 而让用户手动再按一次回车的体验更差。代价是失败确认时间翻倍，
-    # 最坏 2s + 2s = 4s，仍在 5 秒以内。
-    #
-    # 重发不会造成「播放两遍」：只有完整拿到了音频字节才会把它交给播放队列，
-    # 超时那次被放弃的响应对象直接丢弃，永远进不了队列。
+    # 重发策略：
+    #   ReadTimeout / ConnectionError / 超过 ATTEMPT_TIMEOUT -> 重发
+    #   ConnectTimeout                                      -> 重发（可能只是网络抖动）
+    #   非 200                                              -> 不重发（请求本身有问题）
+    # 重发不会造成「播放两遍」：只有完整拿到音频字节才会交给播放队列，
+    # 被放弃的那次响应对象直接丢弃，永远进不了队列。
+    request_started = time.perf_counter()
+    budget_deadline = request_started + REQUEST_BUDGET
     last_failure = None
-    for attempt in (1, 2):
+
+    for attempt in range(1, ATTEMPT_LIMIT + 1):
+        # 总预算已经用完就不再重发
+        if time.perf_counter() >= budget_deadline:
+            last_failure = f'请求超时（超过 {REQUEST_BUDGET:.0f} 秒）'
+            break
         try:
-            # stream=True：先只拿到响应头，便于把「等待服务端」与「接收数据」分开计时
             t_start = time.perf_counter()
+            # 单次尝试的上限，同时不能突破总预算
+            remaining = budget_deadline - t_start
+            attempt_deadline = min(t_start + ATTEMPT_TIMEOUT, budget_deadline)
             response = _http.post(
                 url=config.FULL_API_URL,
                 headers=headers,
                 data=ssml.encode('utf-8'),  # 确保 SSML 字符串以 UTF-8 编码发送
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                timeout=(min(CONNECT_TIMEOUT, remaining),
+                         max(0.1, min(ATTEMPT_TIMEOUT, remaining))),
                 stream=True,
             )
             t_header = time.perf_counter()
@@ -376,34 +431,48 @@ def text_to_speech_web_api(text, config):
                 emit_log(f"[失败] 服务端返回 {response.status_code}")
                 return None
 
-            # 5. 读取响应体
-            #    必须读完整，否则连接不会被归还到连接池，下一句又要重新握手
-            audio_data = response.content
+            # 5. 逐块读取正文。
+            #    不能用 response.content：它是一次性阻塞读取，中途无法干预，
+            #    遇到「慢慢吐数据」的服务端会一直读下去。逐块读才能在每块之间
+            #    检查累计耗时。
+            #    必须读完整，否则连接不会被归还到连接池，下一句又要重新握手。
+            chunks = []
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    chunks.append(chunk)
+                now = time.perf_counter()
+                if now >= attempt_deadline:
+                    raise requests.exceptions.ReadTimeout(
+                        f'body not finished within {ATTEMPT_TIMEOUT:.0f}s')
+                if now >= budget_deadline:
+                    raise requests.exceptions.ReadTimeout(
+                        f'body not finished within the {REQUEST_BUDGET:.0f}s budget')
+            audio_data = b''.join(chunks)
             t_body = time.perf_counter()
 
             print(f"[TTS]   请求 → 响应头   {(t_header - t_start) * 1000:.0f} ms")
             print(f"[TTS]   接收数据        {(t_body - t_header) * 1000:.0f} ms")
-            if attempt == 2:
+            if attempt > 1:
                 print("Succeeded on the automatic retry.")
                 emit_log("[重试] 自动重发成功")
             return audio_data
 
         except requests.exceptions.ConnectTimeout as e:
-            print(f"Connect timeout (attempt {attempt}/2): {e}")
+            print(f"Connect timeout (attempt {attempt}/{ATTEMPT_LIMIT}): {e}")
             last_failure = '连接超时'
-            if attempt == 2:
+            if attempt >= ATTEMPT_LIMIT:
                 break
             emit_log("[重试] 连接超时，自动重发一次")
         except requests.exceptions.ReadTimeout as e:
-            print(f"Read timeout (attempt {attempt}/2): {e}")
+            print(f"Read timeout (attempt {attempt}/{ATTEMPT_LIMIT}): {e}")
             last_failure = '请求超时'
-            if attempt == 2:
+            if attempt >= ATTEMPT_LIMIT:
                 break
             emit_log("[重试] 请求超时，自动重发一次")
         except requests.exceptions.ConnectionError as e:
-            print(f"Connection error (attempt {attempt}/2): {e}")
+            print(f"Connection error (attempt {attempt}/{ATTEMPT_LIMIT}): {e}")
             last_failure = '无法连接服务器'
-            if attempt == 2:
+            if attempt >= ATTEMPT_LIMIT:
                 break
             emit_log("[重试] 连接失败，自动重发一次")
         except requests.exceptions.RequestException as e:
@@ -412,8 +481,8 @@ def text_to_speech_web_api(text, config):
             emit_log(f"[失败] 网络异常（{type(e).__name__}）")
             return None
 
-    print(f"Gave up after two attempts ({last_failure}).")
-    emit_log(f"[失败] {last_failure}（已自动重发一次）")
+    print(f"Gave up after at most {ATTEMPT_LIMIT} attempts ({last_failure}).")
+    emit_log(f"[失败] {last_failure}")
     return None
 
 
@@ -461,19 +530,17 @@ def save_audio_to_file(audio_bytes, config, filename):
                 pass
 
 
-def play_in_background_queued(mp3_path, requested_at=None, ready_ms=None,
-                              ready_label='合成', index=None):
-    """将播放请求添加到队列中。
+def _fill_pending(pending, path, label):
+    """音频就绪：记录就绪时刻并回填播放内容。
 
-    requested_at: 用户触发本次请求（按回车 / 按热键）的时刻，
-                  用于统计「按键 → 出声」的端到端延迟。
-    ready_ms:     从 requested_at 到音频就绪（已落盘 / 已命中缓存）的耗时。
-    ready_label:  上述耗时在界面上的名称：「合成」或「命中」。
-    index:        请求编号，让播放阶段的日志也能带上 #N。
+    「放行」（pending.ready.set()）统一由 text_to_speech.target 的 finally 做，
+    这样无论成功还是失败，播放线程都不会被卡住。
     """
-    _playback_queue.put(_PlaybackTask(mp3_path, time.perf_counter(), requested_at,
-                                      ready_ms, ready_label, index))
-    print(f"Queued for playback: {mp3_path}")
+    now = time.perf_counter()
+    pending.ready_at = now
+    pending.ready_ms = (now - pending.requested_at) * 1000
+    pending.path = path
+    pending.ready_label = label
 
 
 def cleanup_pygame():
@@ -486,58 +553,68 @@ def text_to_speech(text, config):
     # 记录用户触发的时刻，用于统计「按键 → 出声」的端到端延迟
     requested_at = time.perf_counter()
 
+    # 关键：在「提交的这一刻」就分配编号并占住播放队列里的位置。
+    # 合成是并行跑的，如果等合成完成才入队，短句会插到长句前面，
+    # 播放顺序就和输入顺序不一致了。
+    pending = _PendingSpeech(next(_request_seq), requested_at)
+    _playback_queue.put(pending)
+
     def target(text, config):
-        text = search_fixed_collocation(text, config)
-        text = search_word_replacement(text, config)
-        hashed_text = hashlib.md5(
-            f'{config.VOICE}{config.VOICE_STYLE}{config.SPEED}{config.PITCH}{text}'.encode('utf-8')).hexdigest()
-        cache_dir = Path(config.STORED_FILEPATH)
-        cache_file_path = cache_dir / f"{hashed_text}.mp3"
+        try:
+            text = search_fixed_collocation(text, config)
+            text = search_word_replacement(text, config)
+            hashed_text = hashlib.md5(
+                f'{config.VOICE}{config.VOICE_STYLE}{config.SPEED}{config.PITCH}{text}'.encode('utf-8')).hexdigest()
+            cache_dir = Path(config.STORED_FILEPATH)
+            cache_file_path = cache_dir / f"{hashed_text}.mp3"
 
-        # 分隔标题：一条请求的日志从这里开始，方便在界面上区分前后两条。
-        # 标题本身不带 #N，否则会变成「#1 ---- 第 1 条 ----」。
-        index = next(_request_seq)
-        emit_log(f"---- 第 {index} 条：「{_brief(text)}」 ----", with_index=False)
-        # 之后本线程发出的日志（含 text_to_speech_web_api、save_audio_to_file）
-        # 都会自动带上 #N
-        set_request_index(index)
+            # 分隔标题：标题本身不带 #N，否则会变成「#1 ---- 第 1 条 ----」。
+            emit_log(f"---- 第 {pending.index} 条：「{_brief(text)}」 ----", with_index=False)
+            # 之后本线程发出的日志（含 text_to_speech_web_api、save_audio_to_file）
+            # 都会自动带上 #N
+            set_request_index(pending.index)
 
-        # 如果缓存文件存在，将其加入播放队列
-        if cache_file_path.exists():
-            print("[TTS] 缓存命中")
-            emit_log("[缓存] 命中，跳过合成")
-            play_in_background_queued(cache_file_path, requested_at,
-                                      (time.perf_counter() - requested_at) * 1000,
-                                      '命中', index)
-            return
+            # 缓存命中：直接回填占位，交给播放线程
+            if cache_file_path.exists():
+                print("[TTS] 缓存命中")
+                emit_log("[缓存] 命中，跳过合成")
+                _fill_pending(pending, cache_file_path, '命中')
+                return
 
-        # 缓存不存在，生成音频
-        print("[TTS] 缓存未命中，开始合成")
-        emit_log("[合成] 开始")
-        audio_data = text_to_speech_web_api(text, config)
-        if audio_data is None:
-            print("[TTS] 合成失败：本次没有拿到音频")
-            # 失败可能让复用的连接失效，后台补一条，免得下一句又花时间重新握手
-            _rewarm_in_background(config)
-            return
+            # 缓存未命中，生成音频
+            print("[TTS] 缓存未命中，开始合成")
+            emit_log("[合成] 开始")
+            audio_data = text_to_speech_web_api(text, config)
+            if audio_data is None:
+                print("[TTS] 合成失败：本次没有拿到音频")
+                # 失败可能让复用的连接失效，后台补一条，免得下一句又花时间重新握手
+                _rewarm_in_background(config)
+                pending.error = '合成失败'
+                return
 
-        t_save = time.perf_counter()
-        saved = save_audio_to_file(audio_data, config, hashed_text)
-        print(f"[TTS]   落盘            {(time.perf_counter() - t_save) * 1000:.0f} ms")
-        if not saved:
-            print("[TTS] 写盘失败：本次无音频可播放")
-            return
+            t_save = time.perf_counter()
+            saved = save_audio_to_file(audio_data, config, hashed_text)
+            print(f"[TTS]   落盘            {(time.perf_counter() - t_save) * 1000:.0f} ms")
+            if not saved:
+                print("[TTS] 写盘失败：本次无音频可播放")
+                pending.error = '写盘失败'
+                return
 
-        # 「合成」耗时从用户按键算起，到音频落盘完成为止。
-        # 这样它加上「排队」「解码」正好等于端到端总耗时（见 _playback_worker）
-        ready_ms = (time.perf_counter() - requested_at) * 1000
-        emit_log(f"[合成] 完成  {ready_ms:.0f} ms")
+            # 「合成」耗时从用户按键算起，到音频落盘完成为止。
+            # 这样它加上「排队」「解码」正好等于端到端总耗时（见 _playback_worker）
+            _fill_pending(pending, cache_file_path, '合成')
+            emit_log(f"[合成] 完成  {pending.ready_ms:.0f} ms")
 
-        # 只有确实拿到音频文件才加入播放队列
-        play_in_background_queued(cache_file_path, requested_at, ready_ms, '合成', index)
+        except Exception as e:
+            print(f"Unexpected error while preparing speech #{pending.index}: {e}")
+            emit_log("[失败] 准备音频时出错")
+            pending.error = '内部错误'
+        finally:
+            # 关键：无论如何都必须放行。占位若不被放行，播放线程会永久卡在这一条上，
+            # 之后所有句子都再也发不出声音（而且不会有任何提示）
+            pending.ready.set()
 
-    thread = threading.Thread(target=target, args=(text, config), daemon=True)
-    thread.start()
+    threading.Thread(target=target, args=(text, config), daemon=True).start()
 
 
 # --- 清理函数 ---
