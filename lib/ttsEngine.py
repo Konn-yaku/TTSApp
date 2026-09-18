@@ -57,6 +57,10 @@ def search_word_replacement(text, config):
 
 # --- 配置结束 ---
 
+# 全局复用的 HTTP 会话。
+# 复用 TCP/TLS 连接，避免每次请求都重新握手（实测每次新建连接需 2-4 秒）。
+_http = requests.Session()
+
 # 创建一个全局的播放队列
 _playback_queue = queue.Queue()
 
@@ -128,6 +132,20 @@ _playback_thread = threading.Thread(target=_playback_worker, daemon=True)
 _playback_thread.start()
 
 
+def warm_up(config):
+    """提前建立与 TTS 服务的 TCP/TLS 连接，供后续合成请求复用。
+
+    只请求站点根路径（一个静态页面），不消耗任何语音合成配额。
+    失败会被静默吞掉 —— 预热失败只会损失部分优化收益，不影响正常功能。
+    """
+    try:
+        # 默认 stream=False，会完整读取响应并把连接归还到连接池
+        _http.get(config.BASE_URL, timeout=10)
+        print("TTS connection warmed up.")
+    except Exception as e:
+        print(f"Connection warm-up skipped: {e}")
+
+
 def text_to_speech_web_api(text, config):
     """
     模拟网页行为，通过POST请求调用TTS API生成语音。
@@ -175,9 +193,9 @@ def text_to_speech_web_api(text, config):
         'Voice-Variant': config.VOICE.lower(),  # 语音变体，小写
     }
 
-    # 3. 发送 POST 请求
+    # 3. 发送 POST 请求（复用 _http 的持久连接，省去 TCP/TLS 握手）
     try:
-        response = requests.post(
+        response = _http.post(
             url=config.FULL_API_URL,
             headers=headers,
             data=ssml.encode('utf-8'),  # 确保 SSML 字符串以 UTF-8 编码发送

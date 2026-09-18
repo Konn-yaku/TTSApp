@@ -1,3 +1,5 @@
+import threading
+
 import lib.mainWindow
 import lib.ttsEngine
 import lib.globalHotkeyManager
@@ -6,6 +8,8 @@ if __name__ == '__main__':
     config = lib.ttsEngine.Config("./config/sound_model.json",
                                   "./config/fixed_collocation.json",
                                   "./config/word_replacement.json")
+    # 后台预热与 TTS 服务的连接，不阻塞界面启动
+    threading.Thread(target=lib.ttsEngine.warm_up, args=(config,), daemon=True).start()
     hotkey_manager = lib.globalHotkeyManager.GlobalHotkeyManager(config, './config/shortcut_key.json')
     hotkey_manager.start()
     root = lib.mainWindow.DraggableWindow()  # 使用可拖拽的窗口类
