@@ -1,6 +1,8 @@
 import hashlib
 import json
 import re
+import sys
+from xml.sax.saxutils import escape as xml_escape
 
 import requests
 import pygame
@@ -8,6 +10,24 @@ import time
 import threading
 import queue
 from pathlib import Path
+
+
+# --- 程序根目录 ---
+# 打包成单文件 exe 后，__file__ 指向临时解包目录（%TEMP%\_MEIxxxxxx），
+# 不能用它来定位配置与缓存。因此：
+#   冻结运行时 -> 以 app.exe 所在目录为根
+#   源码运行时 -> 以项目根目录（lib 的上一级）为根
+# 配置与缓存必须和程序放在一起（README 要求不可移动文件位置），
+# 不能落在临时目录，否则缓存会随程序退出一起丢失。
+APP_ROOT = (Path(sys.executable).resolve().parent
+            if getattr(sys, 'frozen', False)
+            else Path(__file__).resolve().parent.parent)
+
+
+def resolve_path(path):
+    """将相对路径解析为基于 APP_ROOT 的绝对路径；传入绝对路径时原样返回。"""
+    path = Path(path)
+    return path if path.is_absolute() else APP_ROOT / path
 
 
 # --- 配置 ---
@@ -21,17 +41,24 @@ class Config:
         self.load(*config_path)
 
     def load(self, *config_path):
-        with open(config_path[0], 'r', encoding='utf-8') as f:
+        # 配置文件路径统一基于 APP_ROOT 解析，不再依赖「当前工作目录」
+        sound_model_path = resolve_path(config_path[0])
+        fixed_collocation_path = resolve_path(config_path[1])
+        word_replacement_path = resolve_path(config_path[2])
+
+        with open(sound_model_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             # 直接将字典的键值对作为实例属性
             self.__dict__.update(data)
         # 计算派生属性
         self.FULL_API_URL = self.BASE_URL + self.API_ENDPOINT
+        # 缓存目录同样基于 APP_ROOT 解析成绝对路径
+        self.STORED_FILEPATH = str(resolve_path(self.STORED_FILEPATH))
 
-        with open(config_path[1], 'r', encoding='utf-8') as f:
+        with open(fixed_collocation_path, 'r', encoding='utf-8') as f:
             self.FIXED_COLLOCATION = json.loads(f.read())
 
-        with open(config_path[2], 'r', encoding='utf-8') as f:
+        with open(word_replacement_path, 'r', encoding='utf-8') as f:
             self.WORD_REPLACEMENT = json.loads(f.read())
 
 
@@ -181,6 +208,10 @@ def text_to_speech_web_api(text, config):
     vs_start = f'<mstts:express-as style="{config.VOICE_STYLE}">' if config.VOICE_STYLE.lower() != 'general' else ''
     vs_end = '</mstts:express-as>' if config.VOICE_STYLE.lower() != 'general' else ''
 
+    # 文本必须先做 XML 转义：一旦出现 < 或 &，整段 SSML 就变成非法 XML，
+    # 服务端会直接返回 400（实测可复现），这句话就永远发不出声音。
+    text_escaped = xml_escape(text)
+
     ssml = f'''<speak xmlns="http://www.w3.org/2001/10/synthesis" 
                   xmlns:mstts="http://www.w3.org/2001/mstts" 
                   xmlns:emo="http://www.w3.org/2009/10/emotionml" 
@@ -188,7 +219,7 @@ def text_to_speech_web_api(text, config):
                   xml:lang="zh-CN">
                 <voice name="{config.VOICE}">
                   {vs_start}
-                  <prosody rate="{config.SPEED}%" pitch="{config.PITCH}%">{text}</prosody>
+                  <prosody rate="{config.SPEED}%" pitch="{config.PITCH}%">{text_escaped}</prosody>
                   {vs_end}
                 </voice>
               </speak>'''
@@ -234,13 +265,27 @@ def text_to_speech_web_api(text, config):
 
 
 def save_audio_to_file(audio_bytes, config, filename):
-    """将音频字节数据保存为文件"""
-    if audio_bytes:
-        with open(file=f'{config.STORED_FILEPATH}/{filename}.mp3', mode='wb') as f:
+    """将音频字节数据保存为文件。
+
+    Returns:
+        bool: 写盘成功返回 True，否则 False。
+    """
+    if not audio_bytes:
+        print("No audio data to save.")
+        return False
+
+    try:
+        cache_dir = Path(config.STORED_FILEPATH)
+        # 缓存目录可能被手动清空或删除，写盘前先补建，避免直接写入失败
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(cache_dir / f'{filename}.mp3', mode='wb') as f:
             f.write(audio_bytes)
         print(f"Audio saved to {filename}")
-    else:
-        print("No audio data to save.")
+        return True
+    except OSError as e:
+        # 磁盘满 / 无写入权限等：只让本次失败，不能让异常冒泡把请求线程带走
+        print(f"缓存写入失败：{e}")
+        return False
 
 
 def play_mp3_file(mp3_file_path):
@@ -337,13 +382,18 @@ def text_to_speech(text, config):
         # 缓存不存在，生成音频
         print("[TTS] 缓存未命中，开始合成")
         audio_data = text_to_speech_web_api(text, config)
-        if audio_data:
-            t_save = time.perf_counter()
-            save_audio_to_file(audio_data, config, hashed_text)
-            print(f"[TTS]   落盘            {(time.perf_counter() - t_save) * 1000:.0f} ms")
-        else:
+        if audio_data is None:
             print("[TTS] 合成失败：本次没有拿到音频")
-        # 将（可能刚创建的）文件加入播放队列
+            return
+
+        t_save = time.perf_counter()
+        saved = save_audio_to_file(audio_data, config, hashed_text)
+        print(f"[TTS]   落盘            {(time.perf_counter() - t_save) * 1000:.0f} ms")
+        if not saved:
+            print("[TTS] 写盘失败：本次无音频可播放")
+            return
+
+        # 只有确实拿到音频文件才加入播放队列
         play_in_background_queued(cache_file_path, requested_at)
 
     thread = threading.Thread(target=target, args=(text, config), daemon=True)
@@ -353,8 +403,8 @@ def text_to_speech(text, config):
 # --- 清理函数 ---
 def cleanup_tts_engine():
     """清理 TTS 引擎资源。"""
-    global _stop_playback
     _stop_playback.set()  # 通知播放线程停止
-    # 等待播放线程结束 (可选，daemon=True 线程会随主程序结束)
-    # _playback_thread.join(timeout=2.0)
+    # 等播放线程自己退出后再关 mixer，否则它会访问已关闭的 mixer 而报错
+    # （线程空闲时最多等 queue.get 的 1 秒超时，2 秒足够）
+    _playback_thread.join(timeout=2.0)
     cleanup_pygame()  # 清理 pygame

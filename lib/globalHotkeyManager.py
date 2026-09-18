@@ -1,7 +1,6 @@
 import json
 from pynput import keyboard
-from pathlib import Path
-from lib.ttsEngine import text_to_speech
+from lib.ttsEngine import resolve_path, text_to_speech
 
 
 class GlobalHotkeyManager:
@@ -14,7 +13,8 @@ class GlobalHotkeyManager:
             shortcut_file (str): 快捷键配置文件的路径。
         """
         self.config = config
-        self.shortcut_file = Path(shortcut_file)
+        # 相对路径基于「程序根目录」解析，不依赖当前工作目录
+        self.shortcut_file = resolve_path(shortcut_file)
         self.hotkeys = {}  # 存储 {快捷键字符串: 文本} 的字典
         self.listener = None
         self._load_shortcuts()
