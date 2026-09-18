@@ -33,6 +33,65 @@ def resolve_path(path):
     return path if path.is_absolute() else APP_ROOT / path
 
 
+# --- 运行日志落盘 ---
+# 无控制台（--noconsole）打包后，sys.stdout / sys.stderr 是 None，
+# print() 的内容会被静默丢弃（CPython 对 None 的输出既不报错也不输出）。
+# 那种情况下把它们接到程序目录下的 app.log；
+# 从源码运行（python app.py）时终端是真实的，不做任何改动。
+LOG_FILE_NAME = 'app.log'
+
+
+class _FileLogWriter:
+    """把 print 的输出写进日志文件。
+
+    带锁：合成、播放、预热跑在不同线程里，没有锁时多行日志会互相插进对方中间。
+    每写一次就 flush：否则最后一段日志（往往正是要看的那段）会留在缓冲区里丢掉。
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._lock = threading.Lock()
+
+    def write(self, text):
+        with self._lock:
+            self._stream.write(text)
+            self._stream.flush()
+
+    def flush(self):
+        with self._lock:
+            self._stream.flush()
+
+    def writable(self):
+        return True
+
+    def isatty(self):
+        return False
+
+
+def _redirect_output_to_file():
+    """无控制台运行时把 stdout / stderr 接到 app.log；打不开就放弃，不影响程序本身。"""
+    if sys.stdout is not None and sys.stderr is not None:
+        return None
+    try:
+        # 每次启动重新写：这是「本次运行的日志」，不累积、也不会越长越大
+        stream = open(APP_ROOT / LOG_FILE_NAME, 'w', encoding='utf-8', errors='replace')
+    except OSError:
+        return None
+    writer = _FileLogWriter(stream)
+    sys.stdout = writer  # type: ignore[assignment]
+    sys.stderr = writer  # type: ignore[assignment]
+    print("==== TTSApp " + time.strftime('%Y-%m-%d %H:%M:%S') + " ====")
+    return APP_ROOT / LOG_FILE_NAME
+
+
+_LOG_PATH = _redirect_output_to_file()
+
+
+def log_file_path():
+    """本次运行写日志的文件路径；有控制台（不写文件）时返回 None。"""
+    return _LOG_PATH
+
+
 # --- 界面日志 ---
 # 合成跑在工作线程里，而 Tkinter 只能在主线程操作，直接写控件会崩。
 # 所以工作线程只往队列里放文本，由界面主线程定时取出写进文本框。
