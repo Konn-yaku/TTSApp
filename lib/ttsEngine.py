@@ -72,9 +72,9 @@ def _playback_worker():
     """播放队列中的音频文件的工作线程。"""
     while not _stop_playback.is_set():
         try:
-            # 从队列中获取下一个要播放的文件路径
+            # 从队列中获取下一个任务：(文件路径, 入队时刻, 请求发出时刻)
             # block=True, timeout=1.0 避免无限阻塞，允许检查 _stop_playback
-            mp3_file_path = _playback_queue.get(timeout=1.0)
+            mp3_file_path, queued_at, requested_at = _playback_queue.get(timeout=1.0)
 
             # 处理获取到的路径
             file_path = Path(mp3_file_path)
@@ -95,8 +95,16 @@ def _playback_worker():
 
             try:
                 print(f"Playing: {file_path}")
+                t_load = time.perf_counter()
                 pygame.mixer.music.load(file_path)
+                t_loaded = time.perf_counter()
                 pygame.mixer.music.play()
+                t_playing = time.perf_counter()
+
+                print(f"[TTS]   入队 → 出声   {(t_playing - queued_at) * 1000:.0f} ms"
+                      f"（解码 {(t_loaded - t_load) * 1000:.0f} ms）")
+                if requested_at is not None:
+                    print(f"[TTS]   按键 → 出声   {(t_playing - requested_at) * 1000:.0f} ms")
 
                 # 等待播放完成
                 while pygame.mixer.music.get_busy() and not _stop_playback.is_set():
@@ -195,20 +203,30 @@ def text_to_speech_web_api(text, config):
 
     # 3. 发送 POST 请求（复用 _http 的持久连接，省去 TCP/TLS 握手）
     try:
+        # stream=True：先只拿到响应头，便于把「等待服务端」与「接收数据」分开计时
+        t_start = time.perf_counter()
         response = _http.post(
             url=config.FULL_API_URL,
             headers=headers,
             data=ssml.encode('utf-8'),  # 确保 SSML 字符串以 UTF-8 编码发送
-            timeout=30  # 设置超时，避免请求挂起
+            timeout=30,  # 设置超时，避免请求挂起
+            stream=True,
         )
+        t_header = time.perf_counter()
 
         # 4. 检查响应状态
-        if response.status_code == 200:
-            # 成功，返回音频数据 (bytes)
-            return response.content
-        else:
+        if response.status_code != 200:
             print(f"TTS API Error: {response.status_code} - {response.text}")
             return None
+
+        # 5. 读取响应体
+        #    必须读完整，否则连接不会被归还到连接池，下一句又要重新握手
+        audio_data = response.content
+        t_body = time.perf_counter()
+
+        print(f"[TTS]   请求 → 响应头   {(t_header - t_start) * 1000:.0f} ms")
+        print(f"[TTS]   接收数据        {(t_body - t_header) * 1000:.0f} ms")
+        return audio_data
 
     except requests.exceptions.RequestException as e:
         print(f"Request failed: {e}")
@@ -282,9 +300,13 @@ def play_mp3_file(mp3_file_path):
         return False
 
 
-def play_in_background_queued(mp3_path):
-    """将播放请求添加到队列中。"""
-    _playback_queue.put(mp3_path)
+def play_in_background_queued(mp3_path, requested_at=None):
+    """将播放请求添加到队列中。
+
+    requested_at: 用户触发本次请求（按回车 / 按热键）的时刻，
+                  用于统计「按键 → 出声」的端到端延迟。
+    """
+    _playback_queue.put((mp3_path, time.perf_counter(), requested_at))
     print(f"Queued for playback: {mp3_path}")
 
 
@@ -295,6 +317,9 @@ def cleanup_pygame():
 
 
 def text_to_speech(text, config):
+    # 记录用户触发的时刻，用于统计「按键 → 出声」的端到端延迟
+    requested_at = time.perf_counter()
+
     def target(text, config):
         text = search_fixed_collocation(text, config)
         text = search_word_replacement(text, config)
@@ -305,15 +330,21 @@ def text_to_speech(text, config):
 
         # 如果缓存文件存在，将其加入播放队列
         if cache_file_path.exists():
-            play_in_background_queued(cache_file_path)
+            print("[TTS] 缓存命中")
+            play_in_background_queued(cache_file_path, requested_at)
             return
 
         # 缓存不存在，生成音频
+        print("[TTS] 缓存未命中，开始合成")
         audio_data = text_to_speech_web_api(text, config)
         if audio_data:
+            t_save = time.perf_counter()
             save_audio_to_file(audio_data, config, hashed_text)
+            print(f"[TTS]   落盘            {(time.perf_counter() - t_save) * 1000:.0f} ms")
+        else:
+            print("[TTS] 合成失败：本次没有拿到音频")
         # 将（可能刚创建的）文件加入播放队列
-        play_in_background_queued(cache_file_path)
+        play_in_background_queued(cache_file_path, requested_at)
 
     thread = threading.Thread(target=target, args=(text, config), daemon=True)
     thread.start()
