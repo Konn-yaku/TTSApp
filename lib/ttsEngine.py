@@ -1,7 +1,9 @@
 import hashlib
 import json
+import os
 import re
 import sys
+import tempfile
 from xml.sax.saxutils import escape as xml_escape
 
 import requests
@@ -112,6 +114,13 @@ def search_word_replacement(text, config):
 
 # --- 配置结束 ---
 
+# --- 请求超时（秒）---
+# READ_TIMEOUT 是「相邻两次收到数据之间」的最长间隔，不是整个请求的总时长上限。
+# 取 2 秒的依据：连接复用时实测 20 次「等待响应首字节」，中位数 417 ms、最大 1501 ms，
+# 约留有 33% 余量。超时后界面会明确报错，再按一次回车即可重试。
+CONNECT_TIMEOUT = 2.0
+READ_TIMEOUT = 2.0
+
 # 全局复用的 HTTP 会话。
 # 复用 TCP/TLS 连接，避免每次请求都重新握手（实测每次新建连接需 2-4 秒）。
 _http = requests.Session()
@@ -121,6 +130,12 @@ _playback_queue = queue.Queue()
 
 # 播放线程的控制事件
 _stop_playback = threading.Event()
+
+# 写缓存的互斥锁。
+# 同一句话如果在第一次合成完成前又被提交一次，两个线程会写同一个文件名，
+# 而「写临时文件 + os.replace」是两步，不加锁时第二步会撞上 [WinError 5] 拒绝访问
+# （实测可出现）。单次写入只有 1 ms 左右，串行化的代价可以忽略。
+_save_lock = threading.Lock()
 
 
 def _playback_worker():
@@ -212,20 +227,75 @@ _playback_thread = threading.Thread(target=_playback_worker, daemon=True)
 _playback_thread.start()
 
 
-def warm_up(config):
+def warm_up(config, tag='启动'):
     """提前建立与 TTS 服务的 TCP/TLS 连接，供后续合成请求复用。
 
     只请求站点根路径（一个静态页面），不消耗任何语音合成配额。
-    失败会被静默吞掉 —— 预热失败只会损失部分优化收益，不影响正常功能。
+    失败会被吞掉 —— 预热失败只会损失部分优化收益，不影响正常功能。
+
+    tag: 日志前缀。启动时是「启动」，请求失败后重连时是「重连」。
     """
     try:
         # 默认 stream=False，会完整读取响应并把连接归还到连接池
         _http.get(config.BASE_URL, timeout=10)
         print("TTS connection warmed up.")
-        emit_log("[启动] TTS 连接已预热")
+        emit_log(f"[{tag}] TTS 连接已预热")
     except Exception as e:
         print(f"Connection warm-up skipped: {e}")
-        emit_log("[启动] 连接预热失败，不影响使用")
+        emit_log(f"[{tag}] 连接预热失败，不影响使用")
+
+
+def _rewarm_in_background(config):
+    """请求失败后在后台重新预热连接。
+
+    超时或连接中断可能让连接池里那条复用的连接失效，这里提前补一条，
+    免得下一句又要付一次 TCP/TLS 握手成本。
+    这个动作不依赖「连接到底丢没丢」的判断，无论丢没丢都是安全的。
+    """
+    threading.Thread(target=warm_up, args=(config, '重连'), daemon=True).start()
+
+
+def _post_ssml(config, headers, ssml):
+    """发送 SSML 请求，只在「连接类失败」时重试一次。
+
+    连接池里可能残留一条已被服务端关闭的连接，此时请求根本没送达，
+    换一条新连接重发是安全的，而且几乎必然成功。
+
+    读超时 / 连接超时都**不重试**：
+      - 它们说明服务端慢，重试只会让等待时间翻倍；
+      - 请求可能已经送达并被合成，重发等于重复消耗额度。
+    """
+    last_error = None
+    for attempt in (1, 2):
+        try:
+            response = _http.post(
+                url=config.FULL_API_URL,
+                headers=headers,
+                data=ssml.encode('utf-8'),  # 确保 SSML 字符串以 UTF-8 编码发送
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                stream=True,
+            )
+            if attempt == 2:
+                print("Retried after a connection error and succeeded.")
+                emit_log("[重试] 连接失败，重发成功")
+            return response
+        except requests.exceptions.ConnectTimeout as e:
+            # 握手都没完成，属于「慢」而不是「连接失效」，重试不划算
+            print(f"Connect timeout: {e}")
+            emit_log("[失败] 连接超时")
+            return None
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            print(f"Connection error (attempt {attempt}/2): {e}")
+            continue
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+            emit_log(f"[失败] 网络异常（{type(e).__name__}）")
+            return None
+
+    print(f"Connection failed twice, giving up: {last_error}")
+    emit_log("[失败] 无法连接服务器")
+    return None
 
 
 def text_to_speech_web_api(text, config):
@@ -283,14 +353,10 @@ def text_to_speech_web_api(text, config):
     try:
         # stream=True：先只拿到响应头，便于把「等待服务端」与「接收数据」分开计时
         t_start = time.perf_counter()
-        response = _http.post(
-            url=config.FULL_API_URL,
-            headers=headers,
-            data=ssml.encode('utf-8'),  # 确保 SSML 字符串以 UTF-8 编码发送
-            timeout=30,  # 设置超时，避免请求挂起
-            stream=True,
-        )
+        response = _post_ssml(config, headers, ssml)
         t_header = time.perf_counter()
+        if response is None:
+            return None
 
         # 4. 检查响应状态
         if response.status_code != 200:
@@ -308,7 +374,8 @@ def text_to_speech_web_api(text, config):
         return audio_data
 
     except requests.exceptions.RequestException as e:
-        print(f"Request failed: {e}")
+        # 走到这里说明是「读取正文」阶段失败的（发送阶段的失败已在 _post_ssml 里处理）
+        print(f"Failed while reading response body: {e}")
         # 界面只报异常类型名，完整信息留给控制台，避免把日志行撑爆
         emit_log(f"[失败] 网络异常（{type(e).__name__}）")
         return None
@@ -324,12 +391,24 @@ def save_audio_to_file(audio_bytes, config, filename):
         print("No audio data to save.")
         return False
 
+    temp_path = None
     try:
         cache_dir = Path(config.STORED_FILEPATH)
         # 缓存目录可能被手动清空或删除，写盘前先补建，避免直接写入失败
         cache_dir.mkdir(parents=True, exist_ok=True)
-        with open(cache_dir / f'{filename}.mp3', mode='wb') as f:
-            f.write(audio_bytes)
+
+        with _save_lock:
+            # 先写临时文件再原子替换。
+            # 同一句话如果在第一次合成完成前又被提交一次，两个线程会写同一个文件名，
+            # 直接写目标文件可能让两次写入交错，生成损坏的 mp3。
+            # 临时文件名由 mkstemp 保证唯一，os.replace 又是原子操作，
+            # 所以最终文件必定是「某一次完整写入」的结果。
+            fd, temp_path = tempfile.mkstemp(dir=cache_dir, suffix='.part')
+            with os.fdopen(fd, 'wb') as f:
+                f.write(audio_bytes)
+            os.replace(temp_path, cache_dir / f'{filename}.mp3')
+            temp_path = None
+
         print(f"Audio saved to {filename}")
         return True
     except OSError as e:
@@ -337,6 +416,13 @@ def save_audio_to_file(audio_bytes, config, filename):
         print(f"缓存写入失败：{e}")
         emit_log("[失败] 缓存写入失败")
         return False
+    finally:
+        # 替换成功时 temp_path 已置空；中途失败则清掉残留的临时文件
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def play_in_background_queued(mp3_path, requested_at=None, ready_ms=None, ready_label='合成'):
@@ -383,6 +469,8 @@ def text_to_speech(text, config):
         audio_data = text_to_speech_web_api(text, config)
         if audio_data is None:
             print("[TTS] 合成失败：本次没有拿到音频")
+            # 失败可能让复用的连接失效，后台补一条，免得下一句又花时间重新握手
+            _rewarm_in_background(config)
             return
 
         t_save = time.perf_counter()
