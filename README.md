@@ -56,9 +56,11 @@
 
 #### sound_model.json
 
-本文件用于配置语音模型。其中，"WARM_CONNECTIONS"及以上的项目一般无需修改。VOICE及以下的项目用于配置语音的各种属性，如语音模型，语调，语速，音高等。
+本文件用于配置语音模型。其中，"WARM_CONNECTIONS"及以上的项目一般无需修改。VOICE 到 PITCH 用于配置语音的各种属性，如语音模型，语调，语速，音高等。文件末尾的 AUDIO_* 三项用于适配你的声卡，一般保持默认即可。
 
 其中连接相关的两项含义如下：WARM_CONNECTIONS 是同时合成的句数上限（默认 2）；IDLE_REWARM_SECONDS 是停顿多久后重新连接服务器（默认 100 秒）。
+
+音频输出相关的三项含义如下：AUDIO_RATE 是输出采样率（默认 44100，应与你的声卡或 VoiceMeeter 的主采样率一致）；AUDIO_BUFFER 是音频缓冲的帧数（默认 2048，调大更不容易卡顿，代价是出声稍晚）；AUDIO_MODE 是播放方式（默认 stream，可改为 preload —— 播放前先完整解码，在虚拟声卡上可能更稳）。
 
 VOICE和VOICE_STYLE词条使用的是微软讲述人的词条，可以自行进行查询。SPEED和PITCH两项是百分比进行调整，如SPEED=5，就是语速为105%。
 

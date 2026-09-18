@@ -294,6 +294,128 @@ _save_lock = threading.Lock()
 _request_seq = itertools.count(1)
 
 
+# --- 音频输出参数 ---
+# 三项都能在 config/sound_model.json 里改，用来适配不同的声卡 / 虚拟声卡组合。
+#
+# AUDIO_RATE：打开音频设备用的采样率。服务端给的文件是 24 kHz 单声道，
+#   所以要选**和你的声卡（或 VoiceMeeter）主采样率一致**的值 —— 这样从 SDL 出来
+#   之后不会再被系统重采样一次。VoiceMeeter 看 System Settings →
+#   Preferred Main SampleRate；Windows 默认声卡常见 48000。
+# AUDIO_BUFFER：音频缓冲的帧数。太小（如 512 帧 ≈ 23 ms）时，音频回调稍晚一点
+#   就会丢样本，听感是「卡顿 / 噼啪」；加大更稳，代价是出声稍晚。
+#   2048 帧 @44.1 kHz ≈ 46 ms，相对合成的几百毫秒可以忽略。
+# AUDIO_MODE：播放方式。
+#   'stream'  = SDL_mixer 的 music 通道，边播边解码（音频回调里有活干）
+#   'preload' = 播放前先把整段解码进内存，播放期间回调几乎不干活
+#   两种都是普通设置，遇到卡顿时可以互相对照。
+# 下面几个默认值只在配置文件缺项 / 填了非法值时生效。
+DEFAULT_AUDIO_RATE = 44100
+DEFAULT_AUDIO_BUFFER = 2048
+DEFAULT_AUDIO_MODE = 'stream'
+AUDIO_RATE_RANGE = (8000, 192000)
+AUDIO_BUFFER_RANGE = (128, 8192)
+AUDIO_MODES = ('stream', 'preload')
+
+_audio_rate = DEFAULT_AUDIO_RATE
+_audio_buffer = DEFAULT_AUDIO_BUFFER
+_audio_mode = DEFAULT_AUDIO_MODE
+
+
+def _int_setting(config, name, default, low, high):
+    """读一个整数配置项；缺失 / 非法 / 越界都退回默认值，并在终端说明原因。"""
+    value = getattr(config, name, default) if config is not None else default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        print(f"Invalid {name}={value!r}; using {default}.")
+        return default
+    if not low <= value <= high:
+        print(f"{name}={value} is out of range [{low}, {high}]; using {default}.")
+        return default
+    return value
+
+
+def init_audio(config=None):
+    """按配置初始化音频输出。可重复调用，已初始化就直接返回 True。
+
+    配置不对时不会把程序卡死：先退回默认参数再试一次；都失败就返回 False，
+    由调用方决定怎么办（播放线程会跳过这一条）。
+    """
+    global _audio_rate, _audio_buffer, _audio_mode
+
+    if pygame.mixer.get_init():
+        return True
+
+    if config is not None:
+        _audio_rate = _int_setting(config, 'AUDIO_RATE', DEFAULT_AUDIO_RATE, *AUDIO_RATE_RANGE)
+        _audio_buffer = _int_setting(config, 'AUDIO_BUFFER', DEFAULT_AUDIO_BUFFER,
+                                     *AUDIO_BUFFER_RANGE)
+        mode = str(getattr(config, 'AUDIO_MODE', DEFAULT_AUDIO_MODE)).strip().lower()
+        if mode not in AUDIO_MODES:
+            print(f"Invalid AUDIO_MODE={mode!r}; using {DEFAULT_AUDIO_MODE}.")
+            mode = DEFAULT_AUDIO_MODE
+        _audio_mode = mode
+
+    try:
+        pygame.mixer.init(frequency=_audio_rate, size=-16, channels=2, buffer=_audio_buffer)
+    except pygame.error as e:
+        print(f"Mixer init failed (rate={_audio_rate}, buffer={_audio_buffer}): {e}")
+        try:
+            pygame.mixer.quit()
+        except Exception:
+            pass
+        try:
+            pygame.mixer.init(frequency=DEFAULT_AUDIO_RATE, size=-16, channels=2,
+                              buffer=DEFAULT_AUDIO_BUFFER)
+            _audio_rate, _audio_buffer = DEFAULT_AUDIO_RATE, DEFAULT_AUDIO_BUFFER
+            print("Fell back to the default audio settings.")
+        except pygame.error as e2:
+            print(f"Failed to initialize pygame mixer: {e2}")
+            return False
+
+    # 记进日志：能确认 SDL 实际协商出来的格式，排查卡顿 / 音质问题时有用
+    print(f"Pygame mixer initialized: {pygame.mixer.get_init()} "
+          f"buffer={_audio_buffer} mode={_audio_mode}")
+    return True
+
+
+class _Player:
+    """一层薄封装，让两种播放方式共用后面的计时与日志。
+
+    stream  = SDL_mixer 的 music 通道；preload = 先整段解码进内存再播。
+    """
+
+    def __init__(self, path, mode):
+        self.mode = mode
+        if mode == 'preload':
+            try:
+                self._sound = pygame.mixer.Sound(path)   # 解码在这一步完成
+                self._channel = None
+                return
+            except pygame.error as e:
+                # 这个文件没法预解码（极少见）：退回 music 通道，别让这一句直接没声
+                print(f"Preload failed, falling back to the music channel: {e}")
+                self.mode = 'stream'
+        pygame.mixer.music.load(path)
+
+    def play(self):
+        if self.mode == 'preload':
+            self._channel = self._sound.play()
+        else:
+            pygame.mixer.music.play()
+
+    def busy(self):
+        if self.mode == 'preload':
+            return bool(self._channel.get_busy())
+        return bool(pygame.mixer.music.get_busy())
+
+    def stop(self):
+        if self.mode == 'preload':
+            pygame.mixer.stop()
+        else:
+            pygame.mixer.music.stop()
+
+
 def _playback_worker():
     """播放队列中的音频文件的工作线程。"""
     while not _stop_playback.is_set():
@@ -337,22 +459,18 @@ def _playback_worker():
                 _playback_queue.task_done()  # 标记此任务完成
                 continue
 
-            # 初始化 mixer (如果需要)
-            if not pygame.mixer.get_init():
-                try:
-                    pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
-                    print("Pygame mixer initialized by worker.")
-                except pygame.error as e:
-                    print(f"Failed to initialize pygame mixer: {e}")
-                    _playback_queue.task_done()
-                    continue
+            # 初始化 mixer (如果需要)。配置里可以改采样率 / 缓冲 / 播放方式，
+            # 启动时 app.py 已经按配置初始化过一次，这里是兼底（比如单独引用本模块时）
+            if not init_audio():
+                _playback_queue.task_done()
+                continue
 
             try:
                 print(f"Playing: {file_path}")
                 t_load = time.perf_counter()
-                pygame.mixer.music.load(file_path)
+                player = _Player(file_path, _audio_mode)
                 t_loaded = time.perf_counter()
-                pygame.mixer.music.play()
+                player.play()
                 t_playing = time.perf_counter()
 
                 print(f"[TTS]   就绪 → 出声   {(t_playing - pending.ready_at) * 1000:.0f} ms"
@@ -363,12 +481,12 @@ def _playback_worker():
                 emit_log("[播放] 开始")
 
                 # 等待播放完成
-                while pygame.mixer.music.get_busy() and not _stop_playback.is_set():
+                while player.busy() and not _stop_playback.is_set():
                     time.sleep(0.1)
 
                 # 如果是因为停止信号中断的，可能需要停止音乐
                 if _stop_playback.is_set():
-                    pygame.mixer.music.stop()
+                    player.stop()
                     print("Playback stopped by shutdown signal.")
 
                 emit_log("[播放] 结束")

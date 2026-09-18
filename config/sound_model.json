@@ -9,5 +9,8 @@
   "VOICE": "zh-CN-XiaoxiaoNeural",
   "VOICE_STYLE": "general",
   "SPEED": 0,
-  "PITCH": 0
+  "PITCH": 0,
+  "AUDIO_RATE": 44100,
+  "AUDIO_BUFFER": 2048,
+  "AUDIO_MODE": "stream"
 }

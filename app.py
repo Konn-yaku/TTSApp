@@ -10,6 +10,9 @@ if __name__ == '__main__':
     config = lib.ttsEngine.Config("config/sound_model.json",
                                   "config/fixed_collocation.json",
                                   "config/word_replacement.json")
+    # 按配置初始化音频输出（采样率 / 缓冲 / 播放方式）。
+    # 放在这里而不是等第一次播放，这样设置不生效或设备打不开时，日志里立刻能看到。
+    lib.ttsEngine.init_audio(config)
     # 后台预热与 TTS 服务的连接，不阻塞界面启动
     threading.Thread(target=lib.ttsEngine.warm_up, args=(config,), daemon=True).start()
     hotkey_manager = lib.globalHotkeyManager.GlobalHotkeyManager(config, 'config/shortcut_key.json')
