@@ -1,0 +1,2 @@
+# 占位文件：确保 cache/ 目录在克隆后存在。
+# 程序会把合成的 mp3 写入此目录；若目录缺失，save_audio_to_file 会抛 FileNotFoundError。

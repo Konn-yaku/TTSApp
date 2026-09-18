@@ -1,4 +1,23 @@
-app.exe
-cache/*
-!cache/
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- 虚拟环境 ---
 .venv/
+
+# --- PyInstaller 打包产物 ---
+build/
+dist/
+*.spec
+app.exe
+
+# --- 运行时语音缓存（保留本地，不提交）---
+cache/*
+!cache/.gitkeep
+
+# --- IDE ---
+.idea/
+
+# --- Windows 快捷方式 ---
+*.lnk
