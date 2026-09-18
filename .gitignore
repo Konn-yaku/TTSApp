@@ -14,6 +14,9 @@ app.exe
 TTSApp.zip
 app.log
 
+# --- 发版说明（本地留存，不进仓库）---
+release_note.md
+
 # --- 运行时语音缓存（保留本地，不提交）---
 cache/*
 !cache/.gitkeep
